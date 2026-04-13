@@ -101,15 +101,6 @@ class Eagle3TargetModel(ABC):
                 raise ValueError(
                     f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
                 )
-            aux_hidden_states_layers = [
-                1,
-                num_layers // 2 - 1,
-                num_layers - 4,
-            ]
-        self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):

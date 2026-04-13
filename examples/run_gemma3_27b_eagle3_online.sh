@@ -12,10 +12,9 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path google/gemma-3-27b-it \
     --draft-model-config $ROOT_DIR/configs/gemma3-27b-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/gemma3-27b-regen/merged_regen.jsonl \
-    --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3-merged-regen \
+    --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train.jsonl \
+    --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3-ultrachat \
     --num-epochs 10 \
-    --eval-holdout-ratio 0.03 \
     --batch-size 2 \
     --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
@@ -26,6 +25,6 @@ torchrun \
     --target-model-backend hf \
     --log-interval 500 \
     --eval-interval 2500 \
-    --save-interval 5000 \
+    --save-interval 60000 \
     --report-to tensorboard \
     --embedding-key=language_model.model.embed_tokens.weight
