@@ -15,7 +15,7 @@ torchrun \
     --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train.jsonl \
     --output-dir $ROOT_DIR/outputs/gemma3-27b-eagle3-ultrachat \
     --num-epochs 10 \
-    --batch-size 2 \
+    --batch-size 8 \
     --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
     --max-length 2048 \
@@ -23,8 +23,8 @@ torchrun \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
     --target-model-backend hf \
-    --log-interval 100 \
-    --eval-interval 500 \
-    --save-interval 10000 \
+    --log-interval 500 \
+    --eval-interval 2500 \
+    --save-interval 5000 \
     --report-to tensorboard \
     --embedding-key=language_model.model.embed_tokens.weight

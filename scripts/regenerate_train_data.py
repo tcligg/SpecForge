@@ -1,52 +1,33 @@
 """
-Re-generate training data using SGLang model servers, with preemption-safe
-chunk-based processing suitable for cloud environments (GKE spot + GCSFuse).
+This script will re-generate the dataset from target model,
+which better aligns the draft model with the target model's output distribution.
 
-Design
-------
-The input JSONL is split into fixed-size **chunks** (deterministic, based
-solely on line position and ``--chunk-size``).  Each chunk produces an
-independent output file, and a ``.done`` marker signals completion.
+Usage:
+1. Set up one or more SGLang servers for the target model.
 
-On resume (the default), chunks whose ``.done`` marker already exists are
-skipped.  If the process is preempted mid-chunk, the partial output is
-discarded and the chunk is retried from scratch on the next run — no data
-is silently lost.
+python3 -m sglang.launch_server \
+	--model Qwen/Qwen3.5-35B-A3B \
+	--mem-fraction-static 0.7 \
+	--tp 1 \
+	--trust-remote-code \
+    --cuda-graph-max-bs 128 \
+	--host 0.0.0.0 \
+	--port 30000 \
+	--dtype bfloat16 \
+    --reasoning-parser qwen3
 
-Multiple GKE pods can process the same input file in parallel by using
-``--shard-id`` / ``--total-shards``: each pod only processes chunks where
-``chunk_id % total_shards == shard_id``.
 
-Output layout::
-
-    {output-dir}/
-      chunk_000000.jsonl   # results for lines 0..chunk_size-1
-      chunk_000000.done    # marker: chunk 0 complete
-      chunk_000001.jsonl
-      chunk_000001.done
-      ...
-      errors/
-        chunk_000000_errors.jsonl
-        ...
-
-Usage
------
-1. Start SGLang server(s) for the target model.
-
-2. Run this script::
-
-    python scripts/regenerate_train_data.py \\
-        --model google/gemma-4-26b-a4b-it \\
-        --server-address localhost:30000 localhost:30010 \\
-        --input-file-path data/ultrachat_train.jsonl \\
-        --output-dir outputs/regen/ \\
-        --chunk-size 500 \\
-        --shard-id 0 --total-shards 4 \\
-        --concurrency 128 \\
-        --is-reasoning-model --thinking-ratio 0.7
-
-   On preemption, simply re-run the same command; completed chunks are
-   skipped automatically.
+2. Regenerate the dataset using the `regenerate_train_data.py` script.
+python scripts/regenerate_train_data.py \
+    --model Qwen/Qwen3.5-35B-A3B \
+    --concurrency 128 \
+    --max-tokens 4096 \
+    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
+    --temperature 0.8 \
+    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
+    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
+    --resume \
+    --is-reasoning-model
 """
 
 import argparse
@@ -86,6 +67,15 @@ def parse_arguments():
         "--is-gpt-oss",
         action="store_true",
         help="Whether the model is a GPT-OSS model",
+    )
+    model_group.add_argument(
+        "--thinking-ratio",
+        type=float,
+        default=None,
+        help="Fraction of requests sent with thinking enabled (0 to 1). "
+        "Requires --is-reasoning-model. When set, each request randomly "
+        "enables or disables thinking based on this ratio. "
+        "E.g., 0.7 means 70%% of samples use thinking, 30%% do not.",
     )
     model_group.add_argument(
         "--thinking-ratio",
@@ -343,6 +333,9 @@ def build_query_kwargs(args, messages, max_tokens=None):
     if args.thinking_ratio is not None:
         enable_thinking = random.random() < args.thinking_ratio
         extra_body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    if args.thinking_ratio is not None:
+        enable_thinking = random.random() < args.thinking_ratio
+        extra_body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -487,77 +480,45 @@ def main():
         raise ValueError("Temperature must be between 0.0 and 1.0")
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
+
     if args.thinking_ratio is not None:
         if not (0.0 <= args.thinking_ratio <= 1.0):
             raise ValueError("--thinking-ratio must be between 0.0 and 1.0")
         if not args.is_reasoning_model:
             raise ValueError("--thinking-ratio requires --is-reasoning-model")
-    if not (0 <= args.shard_id < args.total_shards):
-        raise ValueError(
-            f"--shard-id must be in [0, {args.total_shards}), got {args.shard_id}"
-        )
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Read input and compute chunks
-    print("Reading input file...")
-    with open(args.input_file_path, "r") as f:
-        all_lines = f.readlines()
-    total_lines = len(all_lines)
-
-    if args.num_samples is not None:
-        all_lines = all_lines[: args.num_samples]
-        total_lines = len(all_lines)
-
-    # Build chunk list: [(chunk_id, [lines...]), ...]
-    chunks = []
-    for start in range(0, total_lines, args.chunk_size):
-        chunk_id = start // args.chunk_size
-        end = min(start + args.chunk_size, total_lines)
-        chunks.append((chunk_id, all_lines[start:end]))
-
-    total_chunks = len(chunks)
-
-    # Filter to this shard's chunks
-    my_chunks = [
-        (cid, lines)
-        for cid, lines in chunks
-        if cid % args.total_shards == args.shard_id
-    ]
-
-    # Filter out already-done chunks
-    pending_chunks = [
-        (cid, lines)
-        for cid, lines in my_chunks
-        if not is_chunk_done(args.output_dir, cid)
-    ]
-    already_done = len(my_chunks) - len(pending_chunks)
-
-    print("=" * 60)
-    print("  SpecForge Data Regeneration (chunk-based)")
-    print("=" * 60)
-    print(f"  Model:            {args.model}")
-    print(f"  Max tokens:       {args.max_tokens}")
-    print(f"  Temperature:      {args.temperature}")
+    print(f"Configuration:")
+    print(f"  Model path: {args.model}")
+    print(f"  Max tokens: {args.max_tokens}")
+    print(f"  Concurrency: {args.concurrency}")
+    print(f"  Temperature: {args.temperature}")
     if args.thinking_ratio is not None:
-        print(f"  Thinking ratio:   {args.thinking_ratio:.0%}")
-    print(f"  Concurrency:      {args.concurrency} per server")
-    print(f"  Servers:          {args.server_address}")
-    print(f"  Input file:       {args.input_file_path}")
-    print(f"  Output dir:       {args.output_dir}")
-    print(f"  Chunk size:       {args.chunk_size}")
-    print(f"  Total lines:      {total_lines}")
-    print(f"  Total chunks:     {total_chunks}")
-    print(f"  Shard:            {args.shard_id}/{args.total_shards}")
-    print(f"  My chunks:        {len(my_chunks)}")
-    print(f"  Already done:     {already_done}")
-    print(f"  Pending:          {len(pending_chunks)}")
-    print("=" * 60)
+        print(f"  Thinking ratio: {args.thinking_ratio:.0%}")
+    print(f"  API URL: {args.server_address}")
+    print(f"  Input file: {args.input_file_path}")
+    print(f"  Output file: {args.output_file_path}")
+    print(f"  Resume mode: {args.resume}")
+    print("-" * 50)
+    total_lines = sum(1 for _ in open(args.input_file_path))
 
-    if not pending_chunks:
-        print("All chunks already processed. Nothing to do.")
-        return
+    skip_lines = 0
+    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+
+    if args.resume and os.path.exists(args.output_file_path):
+        existing_success = sum(1 for _ in open(args.output_file_path))
+        existing_error = 0
+        if os.path.exists(error_file_path):
+            existing_error = sum(1 for _ in open(error_file_path))
+        skip_lines = existing_success + existing_error
+        print(f"Resume mode enabled:")
+        print(f"  Found {existing_success} successful samples in output file")
+        print(f"  Found {existing_error} error samples in error file")
+        print(f"  Skipping first {skip_lines} input samples")
+        print("-" * 50)
+
+        if skip_lines >= total_lines:
+            print(f"All {total_lines} samples already processed. Nothing to do.")
+            return
 
     # Validate server addresses
     valid_servers = []
