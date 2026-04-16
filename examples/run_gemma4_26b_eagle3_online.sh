@@ -12,7 +12,7 @@ torchrun \
     $ROOT_DIR/scripts/train_eagle3.py \
     --target-model-path google/gemma-4-26b-a4b-it \
     --draft-model-config $ROOT_DIR/configs/gemma4-26b-a4b-eagle3.json \
-    --train-data-path $ROOT_DIR/cache/dataset/ultrachat_train.jsonl \
+    --train-data-path $ROOT_DIR/outputs/dataset/ultrachat_regen_gemma4.jsonl \
     --output-dir $ROOT_DIR/outputs/gemma4-26b-a4b-eagle3-ultrachat \
     --num-epochs 10 \
     --batch-size 4 \

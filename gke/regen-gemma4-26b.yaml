@@ -1,0 +1,113 @@
+# GKE Batch Job: Regenerate training data for Gemma4-26B Eagle3.
+#
+# This job runs 8 indexed pods in parallel.  Each pod launches SGLang
+# servers and processes its assigned shard of *chunks* from the input
+# dataset.  Chunk-based processing ensures preemption safety: completed
+# chunks are marked with .done files, so a restarted pod skips them.
+#
+# All pods write to the same OUTPUT_DIR on GCSFuse.  Because each chunk
+# produces its own output file (chunk_NNNNNN.jsonl), there are no
+# write conflicts between pods.
+#
+# Prerequisites:
+#   - GKE cluster with GPU node pool (H200 x8 spot instances)
+#   - GCS FUSE CSI driver enabled
+#   - Service account with GCS read/write access
+#   - Input dataset at gs://pyc-eagle-data/datasets/ultrachat_train.jsonl
+#   - HuggingFace token secret (for gated model access):
+#       kubectl create secret generic hf-token --from-literal=token=hf_...
+#
+# Usage:
+#   kubectl apply -f gke/regen-gemma4-26b.yaml
+#
+# Monitor:
+#   kubectl get jobs regen-gemma4-26b -w
+#   kubectl logs -l job-name=regen-gemma4-26b -f
+#
+# After completion, merge chunk outputs:
+#   cat /gcs/pyc-eagle-data/datasets/gemma4-26b-regen/chunk_*.jsonl > merged.jsonl
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: regen-gemma4-26b
+spec:
+  completions: 8
+  parallelism: 8
+  completionMode: Indexed
+  backoffLimitPerIndex: 16
+  maxFailedIndexes: 4
+  template:
+    metadata:
+      namespace: default
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        cloud.google.com/gke-accelerator: nvidia-h200-141gb
+        cloud.google.com/gke-accelerator-count: "8"
+        cloud.google.com/gke-gpu-driver-version: "latest"
+      containers:
+      - name: regen
+        image: us-central1-docker.pkg.dev/pyc-vtx-dev/pyc-vtx-us-central1/specforge-regen:latest
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: TOTAL_SHARDS
+          value: "8"
+        - name: MODEL
+          value: "google/gemma-4-26b-a4b-it"
+        - name: INPUT_FILE
+          value: "/gcs/pyc-eagle-data/datasets/ultrachat_train.jsonl"
+        - name: OUTPUT_DIR
+          value: "/gcs/pyc-eagle-data/datasets/gemma4-26b-regen"
+        # Chunking — each chunk is the unit of retry on preemption
+        - name: CHUNK_SIZE
+          value: "500"
+        # SGLang server configuration
+        - name: TP_SIZE
+          value: "2"
+        - name: NUM_SERVERS
+          value: "4"
+        - name: MEM_FRACTION_STATIC
+          value: "0.85"
+        # Regeneration parameters (matching regen_gemma4_26b_data.sh)
+        - name: CONCURRENCY
+          value: "128"
+        - name: MAX_TOKENS
+          value: "2048"
+        - name: TEMPERATURE
+          value: "1"
+        - name: IS_REASONING_MODEL
+          value: "true"
+        - name: THINKING_RATIO
+          value: "0.7"
+        volumeMounts:
+        - name: gcsfuse
+          mountPath: /gcs/pyc-eagle-data
+        - name: dshm
+          mountPath: /dev/shm
+      restartPolicy: OnFailure
+      serviceAccountName: embed-gen-ksa
+      terminationGracePeriodSeconds: 120
+      volumes:
+      - name: gcsfuse
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: pyc-eagle-data
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "48Gi"
+      tolerations:
+      - key: cloud.google.com/gke-spot
+        operator: Equal
+        value: "true"
+        effect: NoSchedule

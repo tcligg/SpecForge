@@ -1,53 +1,80 @@
 """
-This script will re-generate the dataset from target model,
-which better aligns the draft model with the target model's output distribution.
+Re-generate training data using SGLang model servers, with preemption-safe
+chunk-based processing suitable for cloud environments (GKE spot + GCSFuse).
 
-Usage:
-1. Set up one or more SGLang servers for the target model.
+Design
+------
+The input JSONL is split into fixed-size **chunks** (deterministic, based
+solely on line position and ``--chunk-size``).  Each chunk produces an
+independent output file, and a ``.done`` marker signals completion.
 
-python3 -m sglang.launch_server \
-	--model Qwen/Qwen3.5-35B-A3B \
-	--mem-fraction-static 0.7 \
-	--tp 1 \
-	--trust-remote-code \
-    --cuda-graph-max-bs 128 \
-	--host 0.0.0.0 \
-	--port 30000 \
-	--dtype bfloat16 \
-    --reasoning-parser qwen3
+On resume (the default), chunks whose ``.done`` marker already exists are
+skipped.  If the process is preempted mid-chunk, the partial output is
+discarded and the chunk is retried from scratch on the next run — no data
+is silently lost.
 
+Multiple GKE pods can process the same input file in parallel by using
+``--shard-id`` / ``--total-shards``: each pod only processes chunks where
+``chunk_id % total_shards == shard_id``.
 
-2. Regenerate the dataset using the `regenerate_train_data.py` script.
-python scripts/regenerate_train_data.py \
-    --model Qwen/Qwen3.5-35B-A3B \
-    --concurrency 128 \
-    --max-tokens 4096 \
-    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
-    --temperature 0.8 \
-    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
-    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
-    --resume \
-    --is-reasoning-model
+Output layout::
+
+    {output-dir}/
+      chunk_000000.jsonl   # results for lines 0..chunk_size-1
+      chunk_000000.done    # marker: chunk 0 complete
+      chunk_000001.jsonl
+      chunk_000001.done
+      ...
+      errors/
+        chunk_000000_errors.jsonl
+        ...
+
+Usage
+-----
+1. Start SGLang server(s) for the target model.
+
+2. Run this script::
+
+    python scripts/regenerate_train_data.py \\
+        --model google/gemma-4-26b-a4b-it \\
+        --server-address localhost:30000 localhost:30010 \\
+        --input-file-path data/ultrachat_train.jsonl \\
+        --output-dir outputs/regen/ \\
+        --chunk-size 500 \\
+        --shard-id 0 --total-shards 4 \\
+        --concurrency 128 \\
+        --is-reasoning-model --thinking-ratio 0.7
+
+   On preemption, simply re-run the same command; completed chunks are
+   skipped automatically.
 """
 
 import argparse
 import json
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+import tempfile
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from tqdm import tqdm
 
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+
 def parse_arguments():
-    """Parse command line arguments"""
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Re-generate training data using sglang model server"
+        description="Re-generate training data using SGLang model servers "
+        "(preemption-safe, chunk-based)."
     )
 
-    # model related arguments
+    # model
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", type=str, required=True)
     model_group.add_argument(
@@ -71,32 +98,32 @@ def parse_arguments():
     )
 
     # sampling params
-    sampling_params_group = parser.add_argument_group("sampling parameters")
-    sampling_params_group.add_argument(
+    sampling_group = parser.add_argument_group("sampling parameters")
+    sampling_group.add_argument(
         "--temperature",
         type=float,
         default=0.7,
-        help="Temperature for sglang model server",
+        help="Sampling temperature (default: 0.7)",
     )
-    sampling_params_group.add_argument(
+    sampling_group.add_argument(
         "--top-p",
         type=float,
         default=None,
         help="Nucleus sampling top_p",
     )
-    sampling_params_group.add_argument(
+    sampling_group.add_argument(
         "--top-k",
         type=int,
         default=None,
         help="Top-k sampling value sent via extra_body",
     )
-    sampling_params_group.add_argument(
+    sampling_group.add_argument(
         "--repetition-penalty",
         type=float,
         default=None,
         help="Mapped to presence_penalty in the OpenAI API",
     )
-    sampling_params_group.add_argument(
+    sampling_group.add_argument(
         "--max-tokens",
         type=int,
         default=4096,
@@ -104,32 +131,57 @@ def parse_arguments():
     )
 
     # optimization
-    optimization_group = parser.add_argument_group("optimization")
-    optimization_group.add_argument(
+    opt_group = parser.add_argument_group("optimization")
+    opt_group.add_argument(
         "--concurrency",
         type=int,
         default=64,
-        help="The number of requests to send to a single server concurrently, the total number of concurrent requests is concurrency * number of server addresses",
+        help="Concurrent requests per server (default: 64). "
+        "Total concurrency = concurrency * number_of_servers.",
     )
 
-    # data related arguments
+    # data / chunking
     data_group = parser.add_argument_group("data")
     data_group.add_argument(
-        "--input-file-path", type=str, required=True, help="Path to the input file"
+        "--input-file-path",
+        type=str,
+        required=True,
+        help="Path to input JSONL file",
     )
     data_group.add_argument(
-        "--output-file-path", type=str, required=True, help="Path to the output file"
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Directory for chunk output files (created if needed)",
+    )
+    data_group.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500,
+        help="Number of input samples per chunk (default: 500). "
+        "Determines the granularity of resume: smaller chunks mean less "
+        "work is lost on preemption, but more files are created.",
     )
     data_group.add_argument(
         "--num-samples",
         type=int,
         default=None,
-        help="The number of samples to regenerate, if not provided, all samples will be regenerated",
+        help="Max number of samples to process (default: all)",
     )
-    data_group.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from existing output file, skip already processed samples",
+
+    # sharding (for multi-pod parallelism)
+    shard_group = parser.add_argument_group("sharding")
+    shard_group.add_argument(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="This worker's shard index (0-based, default: 0)",
+    )
+    shard_group.add_argument(
+        "--total-shards",
+        type=int,
+        default=1,
+        help="Total number of shards / workers (default: 1)",
     )
 
     # sglang server
@@ -138,34 +190,129 @@ def parse_arguments():
         "--server-address",
         type=str,
         nargs="+",
-        help="Server address and port for sglang model server",
+        required=True,
+        help="Server address(es) as host:port",
     )
-    return parser.parse_args()
+
+    # backward compat (ignored, resume is always on)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="(Ignored — resume is always enabled.) Kept for backward compatibility.",
+    )
+    # backward compat (output-file-path mapped to output-dir)
+    parser.add_argument(
+        "--output-file-path",
+        type=str,
+        default=None,
+        help="(Deprecated — use --output-dir instead.) "
+        "If provided, its parent directory is used as output-dir.",
+    )
+
+    args = parser.parse_args()
+
+    # Handle backward compat: --output-file-path -> --output-dir
+    if args.output_file_path and not args.output_dir:
+        args.output_dir = os.path.dirname(args.output_file_path) or "."
+        print(
+            f"Warning: --output-file-path is deprecated. "
+            f"Using --output-dir={args.output_dir}"
+        )
+
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Chunk management
+# ---------------------------------------------------------------------------
+
+
+def chunk_output_path(output_dir: str, chunk_id: int) -> str:
+    return os.path.join(output_dir, f"chunk_{chunk_id:06d}.jsonl")
+
+
+def chunk_error_path(output_dir: str, chunk_id: int) -> str:
+    return os.path.join(output_dir, "errors", f"chunk_{chunk_id:06d}_errors.jsonl")
+
+
+def chunk_done_path(output_dir: str, chunk_id: int) -> str:
+    return os.path.join(output_dir, f"chunk_{chunk_id:06d}.done")
+
+
+def is_chunk_done(output_dir: str, chunk_id: int) -> bool:
+    return os.path.exists(chunk_done_path(output_dir, chunk_id))
+
+
+def write_chunk_done_marker(output_dir: str, chunk_id: int, stats: dict):
+    """Write a .done marker with stats. Uses write-then-rename for atomicity."""
+    done_path = chunk_done_path(output_dir, chunk_id)
+    done_dir = os.path.dirname(done_path)
+    try:
+        # Write to a temp file then rename for atomicity.
+        # On GCSFuse, rename within the same directory is atomic.
+        fd, tmp_path = tempfile.mkstemp(dir=done_dir, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(stats, f)
+            f.write("\n")
+        shutil.move(tmp_path, done_path)
+    except OSError:
+        # Fallback: direct write (still safe — marker existence is what matters)
+        with open(done_path, "w") as f:
+            json.dump(stats, f)
+            f.write("\n")
+
+
+def write_chunk_results(
+    output_dir: str,
+    chunk_id: int,
+    results: List[dict],
+    errors: List[dict],
+    stats: dict,
+):
+    """
+    Write chunk output, error, and done marker files.
+
+    Results and errors are written fully before the .done marker, so if
+    the process is killed between writes, the chunk will be retried.
+    """
+    out_path = chunk_output_path(output_dir, chunk_id)
+    err_path = chunk_error_path(output_dir, chunk_id)
+
+    # Write results
+    with open(out_path, "w") as f:
+        for item in results:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    # Write errors (if any)
+    if errors:
+        os.makedirs(os.path.dirname(err_path), exist_ok=True)
+        with open(err_path, "w") as f:
+            for item in errors:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    # Mark done last — this is the commit point
+    write_chunk_done_marker(output_dir, chunk_id, stats)
+
+
+# ---------------------------------------------------------------------------
+# SGLang interaction (preserved from original)
+# ---------------------------------------------------------------------------
 
 
 def get_random_reasoning_effort() -> str:
-    """Get a random reasoning effort level for the model with weighted probabilities."""
-    # usage example: https://huggingface.co/openai/gpt-oss-20b/discussions/28
-    # Reasoning effort levels with weights: LOW(4), MEDIUM(4), HIGH(2)
-    reasoning_efforts = [
-        "low",
-        "medium",
-        "high",
-    ]
+    """Get a random reasoning effort level with weighted probabilities."""
+    reasoning_efforts = ["low", "medium", "high"]
     weights = [4, 4, 2]
     return random.choices(reasoning_efforts, weights=weights, k=1)[0]
 
 
 def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
-    """
-    This is a rough estimate of the context length measured in untokenized
-    tokens.
-    """
+    """Rough estimate of context length in whitespace-delimited tokens."""
     length = 0
     for message in conversations:
         content = message.get("content")
         if isinstance(content, str):
-            # {"role": "assistant", "content": "Hi, how can I help?"}
             length += len(content.split())
         elif isinstance(content, list):
             for part in content:
@@ -206,16 +353,16 @@ def build_query_kwargs(args, messages, max_tokens=None):
 def call_sglang(
     args,
     server_address: str,
-    data: List[Dict[str, Any]],
-    max_tokens=None,
-) -> str:
-    """Send a batch of prompts to sglang /v1/completions."""
+    data: Dict[str, Any],
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Regenerate a single sample via an SGLang server."""
     client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
 
     messages = data["conversations"]
     regenerated_messages = []
 
-    # ignore data which starts with an assistant message
+    # Reject data starting with an assistant message
     if messages[0]["role"] == "assistant":
         data["status"] = "error"
         data["error"] = "Data starts with an assistant message"
@@ -228,9 +375,7 @@ def call_sglang(
             continue
         elif message["role"] == "user":
             regenerated_messages.append(message)
-
             query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
-
             try:
                 resp = client.chat.completions.create(**query_kwargs)
             except Exception as e:
@@ -251,225 +396,220 @@ def call_sglang(
             data["status"] = "error"
             data["error"] = f"Invalid message role: {message['role']}"
             return data
+
     data["conversations"] = regenerated_messages
     data["status"] = "success"
     return data
 
 
+# ---------------------------------------------------------------------------
+# Chunk processing
+# ---------------------------------------------------------------------------
+
+
+def process_chunk(
+    args,
+    chunk_id: int,
+    chunk_lines: List[str],
+    server_addresses: List[str],
+) -> Tuple[int, int, dict]:
+    """
+    Process a single chunk: submit all samples concurrently, collect results,
+    write output atomically.
+
+    Returns (success_count, error_count, stats_dict).
+    """
+    total_concurrency = args.concurrency * len(server_addresses)
+    executor = ThreadPoolExecutor(max_workers=total_concurrency)
+
+    # Submit all samples in this chunk
+    futures = []
+    for i, line in enumerate(chunk_lines):
+        data = json.loads(line.strip())
+        # Tag with original position within the chunk for ordered output
+        data["_chunk_pos"] = i
+        server = server_addresses[i % len(server_addresses)]
+        future = executor.submit(call_sglang, args, server, data)
+        futures.append(future)
+
+    # Collect results in submission order
+    results = []
+    errors = []
+    context_lengths = []
+
+    for future in as_completed(futures):
+        regen_data = future.result()
+        pos = regen_data.pop("_chunk_pos", -1)
+
+        if regen_data.get("status") == "error":
+            regen_data["_chunk_pos"] = pos  # keep for debugging
+            errors.append(regen_data)
+        else:
+            ctx_len = compute_context_length(regen_data.get("conversations", []))
+            context_lengths.append(ctx_len)
+            regen_data["_chunk_pos"] = pos
+            results.append(regen_data)
+
+    executor.shutdown(wait=False)
+
+    # Sort by original position so output is deterministic
+    results.sort(key=lambda x: x.pop("_chunk_pos", 0))
+    errors.sort(key=lambda x: x.pop("_chunk_pos", 0))
+
+    # Compute stats
+    stats = {
+        "chunk_id": chunk_id,
+        "total": len(chunk_lines),
+        "success": len(results),
+        "errors": len(errors),
+    }
+    if context_lengths:
+        stats["ctx_len_min"] = min(context_lengths)
+        stats["ctx_len_max"] = max(context_lengths)
+        stats["ctx_len_avg"] = sum(context_lengths) / len(context_lengths)
+
+    # Write output atomically (results, errors, then .done marker)
+    write_chunk_results(args.output_dir, chunk_id, results, errors, stats)
+
+    return len(results), len(errors), stats
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main():
-    # Parse command line arguments
     args = parse_arguments()
 
-    # Validate parameters
+    # Validate
     if not (0.0 <= args.temperature <= 1.0):
         raise ValueError("Temperature must be between 0.0 and 1.0")
-
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
-
     if args.thinking_ratio is not None:
         if not (0.0 <= args.thinking_ratio <= 1.0):
             raise ValueError("--thinking-ratio must be between 0.0 and 1.0")
         if not args.is_reasoning_model:
             raise ValueError("--thinking-ratio requires --is-reasoning-model")
+    if not (0 <= args.shard_id < args.total_shards):
+        raise ValueError(
+            f"--shard-id must be in [0, {args.total_shards}), got {args.shard_id}"
+        )
 
-    print(f"Configuration:")
-    print(f"  Model path: {args.model}")
-    print(f"  Max tokens: {args.max_tokens}")
-    print(f"  Concurrency: {args.concurrency}")
-    print(f"  Temperature: {args.temperature}")
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Read input and compute chunks
+    print("Reading input file...")
+    with open(args.input_file_path, "r") as f:
+        all_lines = f.readlines()
+    total_lines = len(all_lines)
+
+    if args.num_samples is not None:
+        all_lines = all_lines[: args.num_samples]
+        total_lines = len(all_lines)
+
+    # Build chunk list: [(chunk_id, [lines...]), ...]
+    chunks = []
+    for start in range(0, total_lines, args.chunk_size):
+        chunk_id = start // args.chunk_size
+        end = min(start + args.chunk_size, total_lines)
+        chunks.append((chunk_id, all_lines[start:end]))
+
+    total_chunks = len(chunks)
+
+    # Filter to this shard's chunks
+    my_chunks = [
+        (cid, lines)
+        for cid, lines in chunks
+        if cid % args.total_shards == args.shard_id
+    ]
+
+    # Filter out already-done chunks
+    pending_chunks = [
+        (cid, lines)
+        for cid, lines in my_chunks
+        if not is_chunk_done(args.output_dir, cid)
+    ]
+    already_done = len(my_chunks) - len(pending_chunks)
+
+    print("=" * 60)
+    print("  SpecForge Data Regeneration (chunk-based)")
+    print("=" * 60)
+    print(f"  Model:            {args.model}")
+    print(f"  Max tokens:       {args.max_tokens}")
+    print(f"  Temperature:      {args.temperature}")
     if args.thinking_ratio is not None:
-        print(f"  Thinking ratio: {args.thinking_ratio:.0%}")
-    print(f"  API URL: {args.server_address}")
-    print(f"  Input file: {args.input_file_path}")
-    print(f"  Output file: {args.output_file_path}")
-    print(f"  Resume mode: {args.resume}")
-    print("-" * 50)
-    total_lines = sum(1 for _ in open(args.input_file_path))
+        print(f"  Thinking ratio:   {args.thinking_ratio:.0%}")
+    print(f"  Concurrency:      {args.concurrency} per server")
+    print(f"  Servers:          {args.server_address}")
+    print(f"  Input file:       {args.input_file_path}")
+    print(f"  Output dir:       {args.output_dir}")
+    print(f"  Chunk size:       {args.chunk_size}")
+    print(f"  Total lines:      {total_lines}")
+    print(f"  Total chunks:     {total_chunks}")
+    print(f"  Shard:            {args.shard_id}/{args.total_shards}")
+    print(f"  My chunks:        {len(my_chunks)}")
+    print(f"  Already done:     {already_done}")
+    print(f"  Pending:          {len(pending_chunks)}")
+    print("=" * 60)
 
-    skip_lines = 0
-    error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
+    if not pending_chunks:
+        print("All chunks already processed. Nothing to do.")
+        return
 
-    if args.resume and os.path.exists(args.output_file_path):
-        existing_success = sum(1 for _ in open(args.output_file_path))
-        existing_error = 0
-        if os.path.exists(error_file_path):
-            existing_error = sum(1 for _ in open(error_file_path))
-        skip_lines = existing_success + existing_error
-        print(f"Resume mode enabled:")
-        print(f"  Found {existing_success} successful samples in output file")
-        print(f"  Found {existing_error} error samples in error file")
-        print(f"  Skipping first {skip_lines} input samples")
-        print("-" * 50)
-
-        if skip_lines >= total_lines:
-            print(f"All {total_lines} samples already processed. Nothing to do.")
-            return
-
-    # test all server addresses
-    valid_server_addresses = []
-    for server_address in args.server_address:
-        dummy_data = dict(
-            conversations=[{"role": "user", "content": "Hello, how are you?"}]
-        )
-        result = call_sglang(
-            args,
-            server_address,
-            dummy_data,
-            max_tokens=1,
-        )
-        if result is not None:
-            valid_server_addresses.append(server_address)
+    # Validate server addresses
+    valid_servers = []
+    for addr in args.server_address:
+        dummy = {"conversations": [{"role": "user", "content": "ping"}]}
+        result = call_sglang(args, addr, dummy, max_tokens=1)
+        if result is not None and result.get("status") != "error":
+            valid_servers.append(addr)
         else:
-            print(f"Server {server_address} is not available")
+            error_msg = result.get("error", "unknown") if result else "no response"
+            print(f"  Warning: server {addr} not available ({error_msg})")
 
-    if len(valid_server_addresses) == 0:
+    if not valid_servers:
         raise ValueError("No server address is available")
-    print(
-        f"Using {len(valid_server_addresses)} server addresses: {valid_server_addresses}"
+    print(f"Using {len(valid_servers)} server(s): {valid_servers}")
+    print("-" * 60)
+
+    # Process chunks
+    total_success = 0
+    total_errors = 0
+    pbar = tqdm(
+        total=len(pending_chunks),
+        desc=f"Shard {args.shard_id}",
+        initial=0,
     )
-    print("-" * 50)
 
-    # Determine file open mode based on resume flag
-    file_mode = "a" if (args.resume and skip_lines > 0) else "w"
-    print(
-        f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
-    )
-    print(
-        f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
-    )
-    print("-" * 50)
-    context_token_sum = 0
-    context_token_min = None
-    context_token_max = 0
-    success_samples = 0
-    error_samples = 0
+    for chunk_id, chunk_lines in pending_chunks:
+        pbar.set_postfix(chunk=chunk_id, ok=total_success, err=total_errors)
 
-    # Create progress bar
-    with (
-        open(args.input_file_path, "r") as input_file,
-        open(args.output_file_path, file_mode) as output_file_handle,
-        open(error_file_path, file_mode) as error_file_handle,
-    ):
-        executor = ThreadPoolExecutor(
-            max_workers=args.concurrency * len(valid_server_addresses)
+        success, errors, stats = process_chunk(
+            args, chunk_id, chunk_lines, valid_servers
         )
-        waiting_queue = {
-            server_address: [] for server_address in valid_server_addresses
-        }
-        pbar = tqdm(total=total_lines, desc="Processing", initial=skip_lines)
-        start_server_index = 0
+        total_success += success
+        total_errors += errors
+        pbar.update(1)
 
-        if skip_lines > 0:
-            print(f"Skipping {skip_lines} already processed samples...")
-            for _ in range(skip_lines):
-                next(input_file, None)
-            print(f"Resuming from sample {skip_lines + 1}")
+        pbar.set_postfix(chunk=chunk_id, ok=total_success, err=total_errors)
 
-        for line in input_file:
-            if (
-                args.num_samples is not None
-                and success_samples + error_samples >= args.num_samples
-            ):
-                break
+    pbar.close()
 
-            data = json.loads(line.strip())
-
-            # find server address with the least waiting requests
-            server_address = valid_server_addresses[start_server_index]
-            start_server_index = (start_server_index + 1) % len(valid_server_addresses)
-
-            # submit prompt to sglang
-            while len(waiting_queue[server_address]) >= args.concurrency:
-                finished_on_request = False
-                # check if any future is done, if so, write the result to the output file
-                for req_future in waiting_queue[server_address]:
-                    if req_future.done():
-                        regen_data = req_future.result()
-
-                        if regen_data["status"] == "error":
-                            error_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            error_samples += 1
-                        else:
-                            ctx_len = compute_context_length(
-                                regen_data.get("conversations", [])
-                            )
-                            context_token_sum += ctx_len
-                            if context_token_min is None:
-                                context_token_min = ctx_len
-                            else:
-                                context_token_min = min(context_token_min, ctx_len)
-                            context_token_max = max(context_token_max, ctx_len)
-
-                            output_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            success_samples += 1
-                        waiting_queue[server_address].remove(req_future)
-                        finished_on_request = True
-
-                if finished_on_request:
-                    break
-
-            req_future = executor.submit(
-                call_sglang,
-                args,
-                server_address,
-                data,
-            )
-            waiting_queue[server_address].append(req_future)
-            pbar.update(1)
-
-        # deal with all the remaining requests
-        for server_address, waiting_queue_items in waiting_queue.items():
-            for req_future in waiting_queue_items:
-                regen_data = req_future.result()
-                if regen_data["status"] == "error":
-                    error_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    error_samples += 1
-                else:
-                    ctx_len = compute_context_length(
-                        regen_data.get("conversations", [])
-                    )
-                    context_token_sum += ctx_len
-                    if context_token_min is None:
-                        context_token_min = ctx_len
-                    else:
-                        context_token_min = min(context_token_min, ctx_len)
-                    context_token_max = max(context_token_max, ctx_len)
-
-                    output_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    success_samples += 1
-
-    print(f"\nProcessing completed!")
-    if success_samples > 0:
-        avg_len = context_token_sum / success_samples
-        print("Context length statistics (token count over conversations):")
-        print(f"Number of successful examples: {success_samples}")
-        print(f"Shortest context length: {context_token_min}")
-        print(f"Longest context length: {context_token_max}")
-        print(f"Average context length: {avg_len:.2f}")
-    else:
-        print("No successful examples to compute context length statistics.")
-
-    total_processed = success_samples + error_samples
-    if skip_lines > 0:
-        print(f"\nResume processing completed!")
-        print(f"  Previously processed: {skip_lines}")
-        print(
-            f"  Newly processed: {total_processed} ({success_samples} success, {error_samples} failed)"
-        )
-        print(f"  Total: {skip_lines + total_processed}")
-    else:
-        print(
-            f"\nProcessing completed! {success_samples} samples regenerated, {error_samples} samples failed."
-        )
+    # Summary
+    print()
+    print("=" * 60)
+    print("  Processing complete!")
+    print("=" * 60)
+    print(f"  Shard:            {args.shard_id}/{args.total_shards}")
+    print(f"  Chunks processed: {len(pending_chunks)}")
+    print(f"  Previously done:  {already_done}")
+    print(f"  Successful:       {total_success}")
+    print(f"  Errors:           {total_errors}")
+    print(f"  Output dir:       {args.output_dir}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
