@@ -2,21 +2,29 @@
 # Entrypoint for SpecForge data regeneration on GKE batch jobs.
 #
 # This script:
-#   1. Launches SGLang server(s) for the target model.
-#   2. Waits for all servers to become healthy.
-#   3. Runs regenerate_train_data.py with chunk-based processing.
-#      Sharding across pods is handled by the Python script via
-#      --shard-id / --total-shards (derived from JOB_COMPLETION_INDEX).
-#   4. Cleans up servers on exit.
+#   1. Prepares datasets (downloads from HuggingFace, converts to JSONL).
+#   2. Launches SGLang server(s) for the target model.
+#   3. Waits for all servers to become healthy.
+#   4. Runs regenerate_train_data.py for each dataset with chunk-based
+#      processing. Sharding across pods is handled by the Python script
+#      via --shard-id / --total-shards.
+#   5. Cleans up servers on exit.
 #
 # Required environment variables:
 #   JOB_COMPLETION_INDEX  - Set by GKE indexed Job (0-based shard index)
 #   TOTAL_SHARDS          - Total number of job completions
 #   MODEL                 - HuggingFace model ID (e.g. google/gemma-4-26b-a4b-it)
-#   INPUT_FILE            - Path to input JSONL file
-#   OUTPUT_DIR            - Directory to write chunk output files
+#   DATASETS              - Comma-separated dataset names for prepare_data.py
+#                           e.g. ultrachat,perfectblend
+#                           Choices: ultrachat, sharegpt, eaglechat, perfectblend,
+#                           opc, gsm8k, hendrycks_math, math_qa, codealpaca-20k,
+#                           opencodeinstruct, magicoder-evol-instruct, sciq, camel, etc.
+#   OUTPUT_DIR            - Base directory for output (per-dataset subdirs created)
 #
 # Optional environment variables (with defaults):
+#   PREPARE_DATA_DIR      - Where prepare_data.py writes JONLs (default: OUTPUT_DIR/prepared)
+#   INPUT_FILES           - If set, skip prepare_data.py and use these comma-separated
+#                           JSONL paths directly (overrides DATASETS)
 #   TP_SIZE               - Tensor parallel size (default: auto from GPU count)
 #   NUM_SERVERS           - Number of SGLang server instances (default: 1)
 #   BASE_PORT             - First server port (default: 30000)
@@ -33,12 +41,18 @@
 
 set -euo pipefail
 
+SPECFORGE_DIR="/app/specforge"
+
 # ── Validate required env vars ───────────────────────────────────────────────
 : "${JOB_COMPLETION_INDEX:?JOB_COMPLETION_INDEX is required}"
 : "${TOTAL_SHARDS:?TOTAL_SHARDS is required}"
 : "${MODEL:?MODEL is required}"
-: "${INPUT_FILE:?INPUT_FILE is required}"
 : "${OUTPUT_DIR:?OUTPUT_DIR is required}"
+
+if [ -z "${DATASETS:-}" ] && [ -z "${INPUT_FILES:-}" ]; then
+    echo "Error: Either DATASETS or INPUT_FILES must be set."
+    exit 1
+fi
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 AVAIL_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
@@ -53,6 +67,7 @@ THINKING_RATIO="${THINKING_RATIO:-0.7}"
 CHUNK_SIZE="${CHUNK_SIZE:-500}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-}"
+PREPARE_DATA_DIR="${PREPARE_DATA_DIR:-${OUTPUT_DIR}/prepared}"
 EXTRA_SGLANG_ARGS="${EXTRA_SGLANG_ARGS:-}"
 EXTRA_REGEN_ARGS="${EXTRA_REGEN_ARGS:-}"
 
@@ -70,12 +85,74 @@ echo "  Temperature:       ${TEMPERATURE}"
 echo "  Reasoning model:   ${IS_REASONING_MODEL}"
 echo "  Thinking ratio:    ${THINKING_RATIO}"
 echo "  Chunk size:        ${CHUNK_SIZE}"
-echo "  Input file:        ${INPUT_FILE}"
+echo "  Datasets:          ${DATASETS:-<using INPUT_FILES>}"
+echo "  Input files:       ${INPUT_FILES:-<from prepare_data>}"
+echo "  Prepare data dir:  ${PREPARE_DATA_DIR}"
 echo "  Output dir:        ${OUTPUT_DIR}"
 echo "  Mem fraction:      ${MEM_FRACTION_STATIC}"
 echo "============================================================"
 
-# ── Launch SGLang servers ────────────────────────────────────────────────────
+# ── Step 1: Prepare datasets ────────────────────────────────────────────────
+# Only the first shard prepares data; others wait for the files to appear.
+# prepare_data.py is idempotent (skips if output already exists).
+
+if [ -n "${DATASETS:-}" ] && [ -z "${INPUT_FILES:-}" ]; then
+    IFS=',' read -ra DATASET_ARRAY <<< "${DATASETS}"
+
+    echo ""
+    echo "Preparing ${#DATASET_ARRAY[@]} dataset(s)..."
+    mkdir -p "${PREPARE_DATA_DIR}"
+
+    for ds_name in "${DATASET_ARRAY[@]}"; do
+        OUTPUT_JSONL="${PREPARE_DATA_DIR}/${ds_name}_train.jsonl"
+
+        if [ -f "${OUTPUT_JSONL}" ]; then
+            LINES=$(wc -l < "${OUTPUT_JSONL}")
+            echo "  ${ds_name}: already prepared (${LINES} lines), skipping."
+            continue
+        fi
+
+        # Only shard 0 runs prepare_data to avoid redundant downloads
+        if [ "${JOB_COMPLETION_INDEX}" -eq 0 ]; then
+            echo "  ${ds_name}: running prepare_data.py..."
+            python3 "${SPECFORGE_DIR}/scripts/prepare_data.py" \
+                --dataset "${ds_name}" \
+                --output-path "${PREPARE_DATA_DIR}"
+        else
+            echo "  ${ds_name}: waiting for shard 0 to prepare data..."
+            WAIT_ELAPSED=0
+            WAIT_MAX=1800  # 30 minutes
+            while [ ! -f "${OUTPUT_JSONL}" ] && [ "${WAIT_ELAPSED}" -lt "${WAIT_MAX}" ]; do
+                sleep 10
+                WAIT_ELAPSED=$(( WAIT_ELAPSED + 10 ))
+            done
+            if [ ! -f "${OUTPUT_JSONL}" ]; then
+                echo "Error: ${OUTPUT_JSONL} not found after ${WAIT_MAX}s."
+                exit 1
+            fi
+        fi
+
+        echo "  ${ds_name}: ready."
+    done
+
+    # Build INPUT_FILES from prepared data
+    INPUT_FILES_BUILT=""
+    for ds_name in "${DATASET_ARRAY[@]}"; do
+        JSONL="${PREPARE_DATA_DIR}/${ds_name}_train.jsonl"
+        if [ -n "${INPUT_FILES_BUILT}" ]; then
+            INPUT_FILES_BUILT="${INPUT_FILES_BUILT},${JSONL}"
+        else
+            INPUT_FILES_BUILT="${JSONL}"
+        fi
+    done
+    INPUT_FILES="${INPUT_FILES_BUILT}"
+
+    echo ""
+    echo "All datasets prepared. Input files: ${INPUT_FILES}"
+    echo "------------------------------------------------------------"
+fi
+
+# ── Step 2: Launch SGLang servers ────────────────────────────────────────────
 SERVER_PIDS=()
 SERVER_ADDRESSES=()
 
@@ -133,7 +210,7 @@ for i in $(seq 0 $(( NUM_SERVERS - 1 ))); do
     SERVER_ADDRESSES+=("localhost:${PORT}")
 done
 
-# ── Wait for servers ─────────────────────────────────────────────────────────
+# ── Step 3: Wait for servers ─────────────────────────────────────────────────
 echo ""
 echo "Waiting for servers to become healthy..."
 
@@ -171,39 +248,67 @@ done
 echo "All ${NUM_SERVERS} server(s) are ready."
 echo "------------------------------------------------------------"
 
-# ── Run regeneration ─────────────────────────────────────────────────────────
-echo "Starting chunk-based data regeneration..."
+# ── Step 4: Run regeneration for each dataset ────────────────────────────────
+IFS=',' read -ra INPUT_FILE_ARRAY <<< "${INPUT_FILES}"
+TOTAL_DATASETS=${#INPUT_FILE_ARRAY[@]}
 
-REGEN_CMD=(
-    python3 /app/specforge/scripts/regenerate_train_data.py
-    --model "${MODEL}"
-    --concurrency "${CONCURRENCY}"
-    --max-tokens "${MAX_TOKENS}"
-    --temperature "${TEMPERATURE}"
-    --server-address "${SERVER_ADDRESSES[@]}"
-    --input-file-path "${INPUT_FILE}"
-    --output-dir "${OUTPUT_DIR}"
-    --chunk-size "${CHUNK_SIZE}"
-    --shard-id "${JOB_COMPLETION_INDEX}"
-    --total-shards "${TOTAL_SHARDS}"
-)
-
-if [ "${IS_REASONING_MODEL}" = "true" ]; then
-    REGEN_CMD+=(--is-reasoning-model)
-    if [ -n "${THINKING_RATIO}" ]; then
-        REGEN_CMD+=(--thinking-ratio "${THINKING_RATIO}")
-    fi
-fi
-
-if [ -n "${EXTRA_REGEN_ARGS}" ]; then
-    # shellcheck disable=SC2206
-    REGEN_CMD+=(${EXTRA_REGEN_ARGS})
-fi
-
-echo "Running: ${REGEN_CMD[*]}"
-"${REGEN_CMD[@]}"
-
+echo "Starting chunk-based data regeneration for ${TOTAL_DATASETS} dataset(s)..."
 echo ""
+
+DATASET_INDEX=0
+for INPUT_FILE in "${INPUT_FILE_ARRAY[@]}"; do
+    DATASET_INDEX=$(( DATASET_INDEX + 1 ))
+
+    # Derive dataset name from filename (without extension)
+    DATASET_NAME=$(basename "${INPUT_FILE}" .jsonl)
+    DATASET_OUTPUT_DIR="${OUTPUT_DIR}/${DATASET_NAME}"
+
+    echo "============================================================"
+    echo "  Dataset ${DATASET_INDEX}/${TOTAL_DATASETS}: ${DATASET_NAME}"
+    echo "  Input:  ${INPUT_FILE}"
+    echo "  Output: ${DATASET_OUTPUT_DIR}"
+    echo "============================================================"
+
+    if [ ! -f "${INPUT_FILE}" ]; then
+        echo "Warning: ${INPUT_FILE} not found, skipping."
+        continue
+    fi
+
+    REGEN_CMD=(
+        python3 "${SPECFORGE_DIR}/scripts/regenerate_train_data.py"
+        --model "${MODEL}"
+        --concurrency "${CONCURRENCY}"
+        --max-tokens "${MAX_TOKENS}"
+        --temperature "${TEMPERATURE}"
+        --server-address "${SERVER_ADDRESSES[@]}"
+        --input-file-path "${INPUT_FILE}"
+        --output-dir "${DATASET_OUTPUT_DIR}"
+        --chunk-size "${CHUNK_SIZE}"
+        --shard-id "${JOB_COMPLETION_INDEX}"
+        --total-shards "${TOTAL_SHARDS}"
+    )
+
+    if [ "${IS_REASONING_MODEL}" = "true" ]; then
+        REGEN_CMD+=(--is-reasoning-model)
+        if [ -n "${THINKING_RATIO}" ]; then
+            REGEN_CMD+=(--thinking-ratio "${THINKING_RATIO}")
+        fi
+    fi
+
+    if [ -n "${EXTRA_REGEN_ARGS}" ]; then
+        # shellcheck disable=SC2206
+        REGEN_CMD+=(${EXTRA_REGEN_ARGS})
+    fi
+
+    echo "Running: ${REGEN_CMD[*]}"
+    "${REGEN_CMD[@]}"
+
+    echo ""
+    echo "  Dataset ${DATASET_NAME} complete."
+    echo ""
+done
+
 echo "============================================================"
 echo "  Shard ${JOB_COMPLETION_INDEX} complete!"
+echo "  All ${TOTAL_DATASETS} dataset(s) processed."
 echo "============================================================"

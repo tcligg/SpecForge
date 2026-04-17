@@ -1,4 +1,7 @@
-# GKE Batch Job: Regenerate training data for Gemma4-26B Eagle3.
+# GKE Batch Job: Regenerate training data for Gemma3-27B Eagle3.
+#
+# Gemma3-27B is NOT a thinking/reasoning model, so IS_REASONING_MODEL
+# and THINKING_RATIO are disabled.
 #
 # This job runs 8 indexed pods in parallel.  Each pod launches SGLang
 # servers and processes its assigned shard of *chunks* from the input
@@ -18,20 +21,20 @@
 #       kubectl create secret generic hf-token --from-literal=token=hf_...
 #
 # Usage:
-#   kubectl apply -f gke/regen-gemma4-26b.yaml
+#   kubectl apply -f gke/regen-gemma3-27b.yaml
 #
 # Monitor:
-#   kubectl get jobs regen-gemma4-26b -w
-#   kubectl logs -l job-name=regen-gemma4-26b -f
+#   kubectl get jobs regen-gemma3-27b -w
+#   kubectl logs -l job-name=regen-gemma3-27b -f
 #
 # After completion, merge chunk outputs per dataset:
-#   cat /gcs/pyc-eagle-data/datasets/gemma4-26b-regen/perfectblend_train/chunk_*.jsonl > perfectblend_regen.jsonl
-#   cat /gcs/pyc-eagle-data/datasets/gemma4-26b-regen/translate-bp-dataset_train/chunk_*.jsonl > magpie-multilingual_regen.jsonl
+#   cat /gcs/pyc-eagle-data/datasets/gemma3-27b-regen/perfectblend_train/chunk_*.jsonl > perfectblend_regen.jsonl
+#   cat /gcs/pyc-eagle-data/datasets/gemma3-27b-regen/translate-bp-dataset_train/chunk_*.jsonl > magpie-multilingual_regen.jsonl
 
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: regen-gemma4-26b
+  name: regen-gemma3-27b
 spec:
   completions: 8
   parallelism: 8
@@ -51,7 +54,7 @@ spec:
         cloud.google.com/gke-gpu-driver-version: "latest"
       containers:
       - name: regen
-        image: us-central1-docker.pkg.dev/pyc-vtx-dev/pyc-vtx-us-central1/specforge-regen:20260416-070136
+        image: us-central1-docker.pkg.dev/pyc-vtx-dev/pyc-vtx-us-central1/specforge-regen:20260417-000638
         resources:
           limits:
             nvidia.com/gpu: 8
@@ -63,7 +66,7 @@ spec:
         - name: TOTAL_SHARDS
           value: "8"
         - name: MODEL
-          value: "google/gemma-4-26b-a4b-it"
+          value: "/gcs/pyc-eagle-data/models/gemma-3-27b-it"
         # Datasets to prepare and regenerate (comma-separated names
         # matching prepare_data.py --dataset choices)
         - name: DATASETS
@@ -71,28 +74,28 @@ spec:
         - name: PREPARE_DATA_DIR
           value: "/gcs/pyc-eagle-data/datasets/prepared"
         - name: OUTPUT_DIR
-          value: "/gcs/pyc-eagle-data/datasets/gemma4-26b-regen"
+          value: "/gcs/pyc-eagle-data/datasets/gemma3-27b-regen"
         # Chunking — each chunk is the unit of retry on preemption
         - name: CHUNK_SIZE
           value: "500"
         # SGLang server configuration
+        # Gemma3-27B is a dense 27B model — TP=1 fits on a single H200.
         - name: TP_SIZE
           value: "1"
         - name: NUM_SERVERS
           value: "8"
         - name: MEM_FRACTION_STATIC
           value: "0.85"
-        # Regeneration parameters (matching regen_gemma4_26b_data.sh)
+        # Regeneration parameters
         - name: CONCURRENCY
           value: "128"
         - name: MAX_TOKENS
           value: "2048"
         - name: TEMPERATURE
           value: "1"
+        # Gemma3-27B is NOT a reasoning/thinking model
         - name: IS_REASONING_MODEL
-          value: "true"
-        - name: THINKING_RATIO
-          value: "0.7"
+          value: "false"
         volumeMounts:
         - name: gcsfuse
           mountPath: /gcs/pyc-eagle-data

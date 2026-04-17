@@ -28,5 +28,8 @@
   "use_sliding_window": false,
   "vocab_size": 262144,
   "draft_vocab_size": 262144,
-  "target_model_type": "gemma4_text"
+  "target_model_type": "gemma4_text",
+  "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [5, 17, 29]
+  }
 }

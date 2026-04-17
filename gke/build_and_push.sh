@@ -17,9 +17,9 @@ set -euo pipefail
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 REPO_ROOT=$(dirname "$SCRIPT_DIR")
 
-PROJECT="${PROJECT:-cloud-llm-test}"
+PROJECT="${PROJECT:-pyc-vtx-dev}"
 REGION="${REGION:-us-central1}"
-REPO="${REPO:-pyc-dev}"
+REPO="${REPO:-pyc-vtx-us-central1}"
 IMAGE_NAME="${IMAGE_NAME:-specforge-regen}"
 TAG="${1:-${TAG:-$(date +%Y%m%d-%H%M%S)}}"
 
@@ -38,8 +38,9 @@ echo "  Context:   ${REPO_ROOT}"
 echo "============================================================"
 
 # Configure Docker to authenticate with Artifact Registry
+echo ""
 echo "Configuring Docker auth for ${REGISTRY}..."
-gcloud auth configure-docker "${REGISTRY}" --quiet 
+gcloud auth configure-docker "${REGISTRY}" --quiet
 
 # Build
 echo ""
@@ -51,12 +52,11 @@ docker build \
 
 # Push
 echo ""
-echo "Pushing ${FULL_IMAGE}..."
-docker login -u oauth2accesstoken -p $(gcloud auth print-access-token) $REGISTRY
+echo "Running: docker push ${FULL_IMAGE}"
 docker push "${FULL_IMAGE}"
 
 echo ""
 echo "============================================================"
-echo "  Done! Image pushed to:"
-echo "  ${FULL_IMAGE}"
+echo "  Done!"
+echo "  Image: ${FULL_IMAGE}"
 echo "============================================================"
