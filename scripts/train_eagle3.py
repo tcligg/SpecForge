@@ -1,4 +1,5 @@
 import argparse
+import glob
 import hashlib
 import math
 import os
@@ -100,7 +101,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
     # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
-    dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-data-path", type=str, nargs="+", required=True)
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -461,24 +462,55 @@ def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
-) -> Tuple[DataLoader, str, Optional[DataLoader]]:
+) -> Tuple[DataLoader, Optional[str], Optional[DataLoader]]:
     # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
 
+    # Resolve all training data paths: expand directories to their .jsonl files
+    resolved_train_files = []
+    for path in args.train_data_path:
+        if os.path.isdir(path):
+            jsonl_files = sorted(glob.glob(os.path.join(path, "*.jsonl")))
+            if not jsonl_files:
+                raise ValueError(f"No .jsonl files found in directory: {path}")
+            resolved_train_files.extend(jsonl_files)
+        elif os.path.isfile(path):
+            resolved_train_files.append(path)
+        else:
+            raise ValueError(f"Training data path does not exist: {path}")
+    print_on_rank0(
+        f"Resolved {len(resolved_train_files)} training file(s) from "
+        f"{len(args.train_data_path)} path(s)"
+    )
+
     # convert to dataloader
     cache_params_string = (
-        f"{args.train_data_path}-"
+        f"{','.join(sorted(resolved_train_files))}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
+
+    # Build datasets from all resolved files and concatenate
+    from datasets import concatenate_datasets
+
+    train_datasets = []
+    for file_path in resolved_train_files:
+        ds = Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": file_path},
+        )
+        train_datasets.append(ds)
+    train_dataset = (
+        concatenate_datasets(train_datasets)
+        if len(train_datasets) > 1
+        else train_datasets[0]
     )
+    print_on_rank0(f"Combined training dataset: {len(train_dataset)} examples")
+
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
@@ -812,9 +844,14 @@ def main():
         args, draft_model_config, processor
     )
 
-    # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
+    # we load the vocab mapping then (skip when draft_vocab_size == target_vocab_size)
+    if vocab_mapping_path is not None:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank("Loaded vocab mapping")
+    else:
+        print_with_rank(
+            "Skipped vocab mapping loading (draft_vocab_size == target_vocab_size)"
+        )
 
     # Calculate total steps if not provided
     if args.total_steps is None:

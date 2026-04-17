@@ -115,37 +115,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
-
-    Explanation:
-        Multimodal 3D rotary position embedding is an extension to 1D rotary position embedding. The input embedding
-        sequence contains vision (images / videos) embedding and text embedding or just contains text embedding. For
-        vision embedding part, we apply rotary position embedding on temporal, height and width dimension separately.
-        Here we split the channel dimension to 3 chunks for the temporal, height and width rotary position embedding.
-        For text embedding part, we just apply 1D rotary position embedding. The three rotary position index (temporal,
-        height and width) of text embedding is always the same, so the text embedding rotary position embedding has no
-        difference with modern LLMs.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        mrope_section(`List(int)`):
-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
+    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors."""
     mrope_section = mrope_section * 2
     cos = torch.cat(
         [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
@@ -437,7 +407,6 @@ def yarn_linear_ramp_mask(min_val, max_val, dim):
 
 
 class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
-
     def __init__(
         self,
         dim,
@@ -511,7 +480,7 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, additional_fc=True):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -524,14 +493,19 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
+        # When additional_fc=True, the concatenated [embeds, hidden_states] is projected
+        # down to hidden_size before QKV, so QKV input is hidden_size.
+        # When additional_fc=False, QKV takes the raw concatenation of 2*hidden_size.
+        qkv_input_size = self.hidden_size if additional_fc else self.hidden_size * 2
+
         self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+            qkv_input_size, self.num_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            qkv_input_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            qkv_input_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -753,11 +727,6 @@ class LlamaAttention(nn.Module):
 class LlamaFlexAttention(LlamaAttention):
     """
     Attention layer implemented with flex attention. We keep the parameters consistent with LlamaAttention.
-    The used parameters are:
-        - hidden_states: input hidden states
-        - attention_mask: attention mask not expanded, straight from data loader.
-        - position_ids: position ids
-        - past_key_values: dynamic cache used for storing past key and value states.
     """
 
     def forward(
@@ -863,10 +832,6 @@ class LlamaFlexAttention(LlamaAttention):
 class LlamaFlashAttention(LlamaAttention):
     """
     Attention layer implemented with flash attention. We keep the parameters consistent with LlamaAttention.
-    The used parameters are:
-        - hidden_states: input hidden states
-        - position_ids: position ids
-        - cache_hidden: manual cache used for storing past key and value states
     """
 
     def forward(
@@ -979,8 +944,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
     LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
     """
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, additional_fc=True):
+        super().__init__(config, additional_fc=additional_fc)
         assert dist.is_initialized(), (
             f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
         )
@@ -1227,32 +1192,42 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(
+        self, config, attention_backend: str = "sdpa", additional_fc: bool = True
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.additional_fc = additional_fc
 
         if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = LlamaAttention(config=config, additional_fc=additional_fc)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
+            self.self_attn = LlamaFlexAttention(
+                config=config, additional_fc=additional_fc
+            )
         elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
+            self.self_attn = LlamaFlashAttention(
+                config=config, additional_fc=additional_fc
+            )
         elif attention_backend == "usp":
-            self.self_attn = LlamaUSPFlashAttention(config=config)
+            self.self_attn = LlamaUSPFlashAttention(
+                config=config, additional_fc=additional_fc
+            )
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
         self.mlp = LlamaMLP(config)
-        # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # if self.index!=0:
 
         self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        if additional_fc:
+            self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
 
     def forward(
         self,
@@ -1269,15 +1244,11 @@ class LlamaDecoderLayer(nn.Module):
     ]:
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            input_emb (`torch.FloatTensor`): embedded input ids of shape `(batch, seq_len, embed_dim)`
+            hidden_states (`torch.FloatTensor`): projected hidden states of shape `(batch, seq_len, embed_dim)`
             attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
+            position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
             past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
 
@@ -1287,6 +1258,11 @@ class LlamaDecoderLayer(nn.Module):
         input_emb = self.input_layernorm(input_emb)
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+
+        # Optional fc to project 2*H -> H before attention
+        if self.additional_fc:
+            hidden_states = self.fc(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
@@ -1305,11 +1281,10 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # outputs = (hidden_states, return_hidden)
         return hidden_states
 
 
-class LlamaForCausalLMEagle3(Eagle3DraftModel):
+class AquilaForCausalLMEagle3(Eagle3DraftModel):
     config_class = LlamaConfig
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
@@ -1318,11 +1293,25 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
-        self.draft_vocab_size = config.draft_vocab_size
+        # Aquila uses the target model's lm_head by default (no draft vocab subsetting).
+        # If draft_vocab_size is not set, fall back to full vocab_size.
+        self.draft_vocab_size = (
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
+        self.use_target_lm_head = self.draft_vocab_size == config.vocab_size
+
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+
+        # Aquila supports an additional_fc flag; defaults to True
+        self.additional_fc = getattr(config, "additional_fc", True)
+
+        self.midlayer = LlamaDecoderLayer(
+            config,
+            attention_backend=attention_backend,
+            additional_fc=self.additional_fc,
+        )
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1334,9 +1323,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.draft_vocab_size, bias=False
-        )
+        self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
         # Embedding scale factor for target models that use scaled embeddings
         # (e.g., Gemma3/Gemma4 multiply by hidden_size**0.5).  Set via config
@@ -1349,9 +1336,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         else:
             self.embed_scale = 1.0
 
-        # create vocab buffers
+        # Create vocab buffers.
+        # When using target lm_head (full vocab), t2d is all True and d2t is identity.
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        if self.use_target_lm_head:
+            d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
@@ -1365,10 +1355,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         """
         Arguments:
             hidden_states (`torch.FloatTensor`): input to the layer, cat low, mid high hidden_states of shape `(batch, seq_len, hidden_states * 3)`
-            input_ids (`torch.LongTensor`): input ids of shape `(batch, seq_len)`
+            inputs_embeds (`torch.FloatTensor`): embedded input ids of shape `(batch, seq_len, hidden_size)`
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
+            ttt_length (`int`): TTT length for caching hidden states.
         """
         if ttt_length == 1:
             print_with_rank("using ttt_length 1, no need to cache hidden states")
@@ -1425,6 +1415,72 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
         return self.lm_head(norm_hidden_states)
+
+    @torch.no_grad()
+    def load_lm_head(
+        self, model_path: str, lm_head_key: str = "lm_head.weight"
+    ) -> None:
+        """
+        Load the lm_head from the target model. Aquila uses the target model's
+        lm_head by default.
+
+        Args:
+            model_path (str): Path to the target model.
+            lm_head_key (str): Key for the lm_head weight in the state dict.
+        """
+        import glob
+        import json
+        import os
+
+        from safetensors import safe_open
+
+        if os.path.exists(model_path):
+            glob_path = os.path.join(model_path, "*.index.json")
+            index_json_path = glob.glob(glob_path)
+
+            if len(index_json_path) == 0:
+                safetensors_path = os.path.join(model_path, "model.safetensors")
+                if os.path.exists(safetensors_path):
+                    with safe_open(safetensors_path, framework="pt") as f:
+                        self.lm_head.weight.copy_(f.get_tensor(lm_head_key))
+                    return
+
+                pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
+                if os.path.exists(pytorch_model_path):
+                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
+                    self.lm_head.weight.copy_(state_dict[lm_head_key])
+                    return
+
+                raise FileNotFoundError(
+                    f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+                )
+            if len(index_json_path) > 1:
+                raise FileNotFoundError(
+                    f"Multiple index.json files found in {model_path}"
+                )
+            index_json_path = index_json_path[0]
+
+            with open(index_json_path, "r") as f:
+                index_json = json.load(f)
+            ckpt_file = index_json["weight_map"][lm_head_key]
+
+            if ckpt_file.endswith(".safetensors"):
+                with safe_open(
+                    os.path.join(model_path, ckpt_file), framework="pt"
+                ) as f:
+                    self.lm_head.weight.copy_(f.get_tensor(lm_head_key))
+            else:
+                state_dict = torch.load(os.path.join(model_path, ckpt_file))
+                self.lm_head.weight.copy_(state_dict[lm_head_key])
+        else:
+            from huggingface_hub import snapshot_download
+
+            local_cache_path = snapshot_download(repo_id=model_path)
+            self.load_lm_head(local_cache_path, lm_head_key)
+
+    def freeze_lm_head(self) -> None:
+        """Freeze the lm_head so it is not updated during training."""
+        self.lm_head.weight.requires_grad = False
 
     def backbone(
         self,

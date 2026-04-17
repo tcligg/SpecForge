@@ -58,6 +58,7 @@ def parse_args():
             "magicoder-evol-instruct",
             "sciq",
             "camel",
+            "magpie-multilingual",
         ],
         help="The demo dataset to quickly run the training for speculative decoding",
     )
@@ -522,6 +523,56 @@ def process_camel_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
     return processed_row, 0
 
 
+def process_gemini_bp_row(row: Dict, dataset_name: str = None) -> Tuple[Dict, int]:
+    """Process a row in Gemini Batch Predictions format.
+
+    The function expects a row with the following schema:
+    {
+        "id": str,
+        "request": {
+            "systemInstruction": {"parts": [{"text": str}], "role": "system"},
+            "contents": [{"parts": [{"text": str}], "role": "user"|"model"}, ...]
+        },
+        ...
+    }
+
+    Converts to the standard conversations format used by SpecForge.
+    """
+    conversations = []
+
+    # System instruction
+    sys_inst = row.get("request", {}).get("systemInstruction")
+    if sys_inst:
+        parts = sys_inst.get("parts", [])
+        text = " ".join(p.get("text", "") for p in parts if p.get("text"))
+        if text:
+            conversations.append({"role": "system", "content": text})
+
+    # Contents (user/model turns)
+    for content in row.get("request", {}).get("contents", []):
+        role = content.get("role", "user")
+        if role == "model":
+            role = "assistant"
+        parts = content.get("parts", [])
+        text = " ".join(p.get("text", "") for p in parts if p.get("text"))
+        if text:
+            conversations.append({"role": role, "content": text})
+
+    if not conversations:
+        return None, 0
+
+    row_id = row.get(
+        "id",
+        hashlib.md5(json.dumps(conversations, sort_keys=True).encode()).hexdigest(),
+    )
+
+    processed_row = {
+        "id": row_id,
+        "conversations": conversations,
+    }
+    return processed_row, 0
+
+
 def add_index(row, idx) -> Dict:
     row["id"] = idx
     return row
@@ -648,6 +699,16 @@ def main():
         ]
         ds = concatenate_datasets(camel_datasets)
         proc_fn = process_camel_row
+    elif args.dataset == "magpie-multilingual":
+        # Gemini Batch Predictions JSONL — requires --data-path
+        if args.data_path is None:
+            raise ValueError(
+                "magpie-multilingual requires --data-path pointing to the "
+                "Gemini Batch Predictions JSONL file."
+            )
+        print(f"Loading magpie-multilingual from: {args.data_path}")
+        ds = load_dataset("json", data_files=args.data_path, split="train")
+        proc_fn = process_gemini_bp_row
     else:
         raise ValueError(
             f"This script only supports ultrachat, sharegpt, sharegpt4v, allava4v, opc, gsm8k, hendrycks_math, math_qa, codealpaca-20k, opencodeinstruct, magicoder-evol-instruct, sciq, camel, and perfect-blend-gptoss-20B datasets for demo purpose, if you wish to use other datasets, please modify this script."
