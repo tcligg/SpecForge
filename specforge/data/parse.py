@@ -43,8 +43,24 @@ class Parser(ABC):
         1. `tool_calls` is a string → Parse as a list
         2. `tool_calls[].function.arguments` is a string → Parse as a dictionary
         3. Non-standard fields (extra, etc.) in `tool_calls[]` → Remove
+        4. `content` is null or not a string → Convert to empty string or extract text from VLM-style list.
         """
         cleaned = {k: v for k, v in message.items() if k in self.standard_keys}
+
+        # ===== Handle content type =====
+        content = cleaned.get("content")
+        if isinstance(content, list):
+            # Handle VLM-style content: extract text parts
+            new_content = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    new_content.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    new_content.append(item)
+            cleaned["content"] = "\n".join(new_content)
+        elif not isinstance(content, str):
+            # Handle None or other non-string types by converting to an empty string
+            cleaned["content"] = ""
 
         # ===== handle tool_calls =====
         if "tool_calls" in cleaned:
