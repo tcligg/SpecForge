@@ -13,7 +13,7 @@
 #   4. Run regenerate_train_data.py with chunk-based processing.
 #   5. Shut down servers on exit.
 
-FROM lmsysorg/sglang:dev
+FROM lmsysorg/sglang:nightly-dev-20260416-a4cf2ea1
 
 # Install system dependencies
 RUN apt-get update && \

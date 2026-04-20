@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
 Deploy per-dataset regen batch jobs across multiple GKE clusters.
-
 For each dataset, the script:
   1. Patches the YAML with that single dataset, GPU type, and a unique job name.
   2. Submits to ALL (cluster x gpu_type) combinations.
   3. Waits until one combination has enough pods Running.
   4. Deletes the job from all other combinations.
   5. Moves on to the next dataset.
-
 Usage:
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --status
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --delete
-  python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --build
+  python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --execute
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --gpu-types nvidia-h100-80gb
 """
 
@@ -42,6 +40,7 @@ class Config:
     project: str = "cloud-llm-test"
     schedule_timeout: int = 3600
     job_yaml: str = ""
+    output_dir: Optional[str] = None
     datasets: List[str] = field(default_factory=list)
     gpu_types: List[str] = field(default_factory=list)
     clusters: List[Tuple[str, str]] = field(default_factory=list)
@@ -55,6 +54,7 @@ class Config:
         cfg.project = args.project
         cfg.schedule_timeout = args.timeout
         cfg.job_yaml = args.yaml
+        cfg.output_dir = args.output_dir
         cfg.datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
         cfg.gpu_types = [g.strip() for g in args.gpu_types.split(",") if g.strip()]
 
@@ -195,33 +195,44 @@ def make_job_name(base: str, dataset: str, gpu_type: str, region: str) -> str:
 
 
 def patch_and_apply_yaml(
-    job_yaml: str,
-    base_name: str,
+    cfg: Config,
     dataset: str,
     gpu_type: str,
     region: str,
 ) -> Tuple[bool, str]:
     """Patch YAML and apply via kubectl. Returns (success, error_message)."""
-    job_name = make_job_name(base_name, dataset, gpu_type, region)
+    job_name = make_job_name(cfg.base_name, dataset, gpu_type, region)
 
-    with open(job_yaml) as f:
+    with open(cfg.job_yaml) as f:
         content = f.read()
 
     # Patch job name (first occurrence)
-    content = content.replace(f"name: {base_name}", f"name: {job_name}", 1)
+    content = content.replace(f"name: {cfg.base_name}", f"name: {job_name}", 1)
 
     # Patch DATASETS value and GPU type
     lines = content.splitlines()
     patched_lines = []
-    patch_next_value = False
+    in_datasets_env = False
+    in_output_dir_env = False
+
     for line in lines:
-        if patch_next_value and "value:" in line:
+        if in_datasets_env and "value:" in line:
             line = re.sub(r'value: ".*"', f'value: "{dataset}"', line)
-            patch_next_value = False
+            in_datasets_env = False
+        elif in_output_dir_env and "value:" in line and cfg.output_dir:
+            # Convert gs://bucket/path -> /gcs/bucket/path
+            gcs_path = cfg.output_dir.replace("gs://", "/gcs/")
+            line = re.sub(r'value: ".*"', f'value: "{gcs_path}"', line)
+            in_output_dir_env = False
+
         if "name: DATASETS" in line:
-            patch_next_value = True
+            in_datasets_env = True
+        elif "name: OUTPUT_DIR" in line:
+            in_output_dir_env = True
+
         if "gke-accelerator:" in line and "accelerator-count" not in line:
             line = re.sub(r"gke-accelerator: .*", f"gke-accelerator: {gpu_type}", line)
+
         patched_lines.append(line)
 
     patched_content = "\n".join(patched_lines) + "\n"
@@ -304,8 +315,11 @@ def cmd_delete(cfg: Config):
     print("Done.")
 
 
-def deploy_dataset(cfg: Config, dataset: str):
-    """Deploy a single dataset across all (cluster x gpu_type) combos."""
+def deploy_dataset(cfg: Config, dataset: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Deploy a single dataset across all (cluster x gpu_type) combos.
+    Returns the (job_name, cluster, region) of the winning job, or None.
+    """
     print()
     print("=" * 60)
     print(f"  Deploying: {dataset}")
@@ -324,8 +338,7 @@ def deploy_dataset(cfg: Config, dataset: str):
                 continue
 
             success, err = patch_and_apply_yaml(
-                cfg.job_yaml,
-                cfg.base_name,
+                cfg,
                 dataset,
                 gpu,
                 region,
@@ -340,7 +353,7 @@ def deploy_dataset(cfg: Config, dataset: str):
 
     if not submitted:
         print(f"  Error: Failed to submit {dataset} to any cluster.")
-        return
+        return None
 
     # Phase 2: Wait for pods to schedule
     print(f"  Waiting up to {cfg.schedule_timeout}s for pods to schedule...")
@@ -373,7 +386,7 @@ def deploy_dataset(cfg: Config, dataset: str):
             f"  Warning: {dataset} not scheduled within "
             f"{cfg.schedule_timeout}s. Jobs remain submitted."
         )
-        return
+        return None
 
     # Phase 3: Keep winner, delete the rest
     win_cluster, win_region, win_gpu = winner
@@ -389,6 +402,7 @@ def deploy_dataset(cfg: Config, dataset: str):
             print(f"  {job_name}: deleted.")
 
     print(f"  {dataset} -> {winner_name} ({win_cluster}, {gpu_short_name(win_gpu)})")
+    return winner_name, win_cluster, win_region
 
 
 def cmd_deploy(cfg: Config):
@@ -411,6 +425,8 @@ def cmd_deploy(cfg: Config):
     print(f"  GPU types:  {', '.join(gpu_short_name(g) for g in cfg.gpu_types)}")
     print(f"  Clusters:   {len(cfg.clusters)}")
     print(f"  Timeout:    {cfg.schedule_timeout}s per dataset")
+    if cfg.output_dir:
+        print(f"  Output Dir: {cfg.output_dir}")
     print("=" * 60)
 
     for ds in cfg.datasets:
@@ -422,64 +438,164 @@ def cmd_deploy(cfg: Config):
     print("=" * 60)
 
 
-def cmd_build_and_redeploy(cfg: Config):
-    """Build image, push, update YAML, delete old jobs, deploy new ones."""
+def cmd_execute(cfg: Config):
+    """End-to-end workflow: build, push, deploy, wait, merge."""
+    print()
+    print("============================================================")
+    print("  Executing End-to-End Regeneration Workflow")
+    print("============================================================")
+
+    # 1. Build and push image, update YAML
+    new_image_uri = _build_and_push_image(cfg)
+    with open(cfg.job_yaml) as f:
+        content = f.read()
+    content = re.sub(r"(image:\s*)(\S+)", rf"\g<1>{new_image_uri}", content, count=1)
+    with open(cfg.job_yaml, "w") as f:
+        f.write(content)
+    print(f"Updated {cfg.job_yaml} to use image {new_image_uri}")
+
+    # 2. Delete any old jobs
+    cmd_delete(cfg)
+
+    # 3. Deploy, wait, and merge for each dataset
+    for ds in cfg.datasets:
+        winner_job = deploy_dataset(cfg, ds)
+        if not winner_job:
+            print(f"  Warning: Failed to deploy dataset {ds}. Skipping.")
+            continue
+
+        job_name, cluster, region = winner_job
+        print(f"  Monitoring job {job_name} in {cluster}...")
+        success = _wait_for_job_completion(job_name, cluster, region, cfg)
+        if not success:
+            print(f"  Error: Job {job_name} failed or timed out. Skipping merge.")
+            continue
+
+        print(f"  Job {job_name} completed. Merging output chunks...")
+        _merge_output_chunks(cfg, ds)
+
+    print()
+    print("============================================================")
+    print("  Workflow Complete")
+    print("============================================================")
+
+
+def _build_and_push_image(cfg: Config) -> str:
+    """Builds and pushes the Docker image, returning the new image URI."""
     print()
     print("Building and pushing new image...")
     build_script = str(SCRIPT_DIR / "build_and_push.sh")
+    project_root = SCRIPT_DIR.parent
     result = subprocess.run(
         ["bash", build_script],
         capture_output=True,
         text=True,
+        check=True,
+        cwd=project_root,
     )
     print(result.stdout)
-    if result.returncode != 0:
-        print(f"Error: Build failed.\n{result.stderr}")
-        sys.exit(1)
 
-    # Extract new tag from output
-    new_tag = None
+    new_image_uri = None
     for line in result.stdout.splitlines():
-        if "Image:" in line:
-            match = re.search(r"specforge-regen:(\S+)", line)
-            if match:
-                new_tag = match.group(1)
+        if "Full tag:" in line:
+            new_image_uri = line.split("Full tag:")[-1].strip()
+            break
 
-    if not new_tag:
-        print("Error: Could not extract image tag from build output.")
+    if not new_image_uri:
+        print("Error: Could not extract 'Full tag:' from build output.")
         sys.exit(1)
 
-    new_image = (
-        f"us-central1-docker.pkg.dev/pyc-vtx-dev/"
-        f"pyc-vtx-us-central1/specforge-regen:{new_tag}"
-    )
-    print(f"Updating YAML image to: {new_image}")
-
-    with open(cfg.job_yaml) as f:
-        content = f.read()
-
-    content = re.sub(
-        r"(image:\s*)(\S+)",
-        rf"\g<1>{new_image}",
-        content,
-        count=1,
-    )
-
-    with open(cfg.job_yaml, "w") as f:
-        f.write(content)
-
-    print()
-    cmd_delete(cfg)
-    print()
-    cmd_deploy(cfg)
+    return new_image_uri
 
 
-def cmd_redeploy(cfg: Config):
-    print()
-    print("Redeploying (delete + deploy)...")
-    cmd_delete(cfg)
-    print()
-    cmd_deploy(cfg)
+def _wait_for_job_completion(
+    job_name: str, cluster: str, region: str, cfg: Config, timeout: int = 7200
+) -> bool:
+    """Polls a GKE job until it completes or fails."""
+    if not use_cluster(cluster, region, cfg.project):
+        print(f"Error: Could not switch to cluster {cluster} to monitor job.")
+        return False
+
+    elapsed = 0
+    while elapsed < timeout:
+        output = run_output(
+            ["kubectl", "get", "job", job_name, "-o", "jsonpath='{.status.conditions[*].type}'"]
+        )
+        # output is single-quoted, e.g. 'Complete' or 'Failed'
+        status = output.strip("'")
+
+        if "Complete" in status:
+            print(f"  Job {job_name} completed successfully.")
+            return True
+        if "Failed" in status:
+            print(f"  Error: Job {job_name} has failed.")
+            return False
+
+        print(f"  [{elapsed}s] Job {job_name} still running...")
+        time.sleep(60)
+        elapsed += 60
+
+    print(f"  Error: Timeout waiting for job {job_name} to complete.")
+    return False
+
+
+def _merge_output_chunks(cfg: Config, dataset: str):
+    """Merges output chunks in GCS using gsutil compose."""
+    # This requires gsutil to be installed and authenticated.
+    # Extract GCS bucket and base path from YAML's OUTPUT_DIR
+    output_dir = cfg.output_dir
+    if not output_dir:
+        with open(cfg.job_yaml) as f:
+            yaml_content = f.read()
+        match = re.search(r'name: OUTPUT_DIR\s+value: "/gcs/([^"]+)"', yaml_content)
+        if not match:
+            print(f"Warning: Could not determine OUTPUT_DIR from {cfg.job_yaml}. Cannot merge.")
+            return
+        output_dir = "gs://" + match.group(1)
+
+    bucket_name = output_dir.replace("gs://", "").split("/")[0]
+    base_path = "/".join(output_dir.replace("gs://", "").split("/")[1:])
+
+    # The input file stem is used as the dataset name in regen_entrypoint.py
+    # We need to find what the original file was.
+    # This is a simplification; a more robust solution might need to check
+    # INPUT_FILES or PREPARE_DATA_DIR. For now, assume common names.
+    if dataset == "magpie-multilingual":
+        dataset_name_stem = "translate-bp-dataset_train"
+    else:
+        dataset_name_stem = f"{dataset}_train"
+
+    chunks_dir = f"gs://{bucket_name}/{base_path}/{dataset_name_stem}"
+    merged_file = f"gs://{bucket_name}/{base_path}/{dataset}_regen.jsonl"
+
+    print(f"  Composing chunks from {chunks_dir} into {merged_file}...")
+
+    # Get list of chunks
+    chunk_list_str = run_output(["gsutil", "ls", f"{chunks_dir}/chunk_*.jsonl"])
+    if not chunk_list_str:
+        print(f"Warning: No chunk files found at {chunks_dir}. Nothing to merge.")
+        return
+
+    chunks = chunk_list_str.splitlines()
+    if len(chunks) > 1024:
+        print(f"Warning: >1024 chunks found for {dataset}. gsutil compose has a limit of 1024.")
+        print("  Merging first 1024 chunks only.")
+        chunks = chunks[:1024]
+    
+    # Compose command
+    compose_cmd = ["gsutil", "-m", "compose"] + chunks + [merged_file]
+    
+    # Delete the merged file if it exists, as compose fails otherwise
+    run_output(["gsutil", "rm", merged_file])
+
+    result = subprocess.run(compose_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error: gsutil compose failed for {dataset}.")
+        print(result.stderr)
+    else:
+        print(f"  Successfully merged {len(chunks)} chunks for {dataset}.")
+        # Optional: delete the source chunks
+        # run_output(["gsutil", "-m", "rm"] + chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +619,11 @@ def main():
         "--datasets",
         default="magpie-multilingual,perfectblend",
         help="Comma-separated dataset names (default: magpie-multilingual,perfectblend)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="GCS output directory (e.g. gs://my-bucket/output). Overrides YAML.",
     )
     parser.add_argument(
         "--gpu-types",
@@ -535,10 +656,9 @@ def main():
         "--delete", action="store_true", help="Delete all jobs from all clusters"
     )
     cmd_group.add_argument(
-        "--redeploy", action="store_true", help="Delete existing jobs and redeploy"
-    )
-    cmd_group.add_argument(
-        "--build", action="store_true", help="Build image, push, update YAML, redeploy"
+        "--execute",
+        action="store_true",
+        help="Run the full workflow: build, push, deploy, wait, and merge",
     )
 
     args = parser.parse_args()
@@ -548,10 +668,8 @@ def main():
         cmd_status(cfg)
     elif args.delete:
         cmd_delete(cfg)
-    elif args.redeploy:
-        cmd_redeploy(cfg)
-    elif args.build:
-        cmd_build_and_redeploy(cfg)
+    elif args.execute:
+        cmd_execute(cfg)
     else:
         cmd_deploy(cfg)
 

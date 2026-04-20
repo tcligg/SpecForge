@@ -54,7 +54,7 @@ spec:
         cloud.google.com/gke-gpu-driver-version: "latest"
       containers:
       - name: regen
-        image: us-central1-docker.pkg.dev/pyc-vtx-dev/pyc-vtx-us-central1/specforge-regen:20260417-000638
+        image: us-central1-docker.pkg.dev/cloud-llm-test/tcli-test/specforge-regen:20260418-011202
         resources:
           limits:
             nvidia.com/gpu: 8

@@ -17,9 +17,9 @@ set -euo pipefail
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 REPO_ROOT=$(dirname "$SCRIPT_DIR")
 
-PROJECT="${PROJECT:-pyc-vtx-dev}"
+PROJECT="${PROJECT:-cloud-llm-test}"
 REGION="${REGION:-us-central1}"
-REPO="${REPO:-pyc-vtx-us-central1}"
+REPO="${REPO:-tcli-test}"
 IMAGE_NAME="${IMAGE_NAME:-specforge-regen}"
 TAG="${1:-${TAG:-$(date +%Y%m%d-%H%M%S)}}"
 
@@ -46,6 +46,7 @@ gcloud auth configure-docker "${REGISTRY}" --quiet
 echo ""
 echo "Building image..."
 docker build \
+    --pull \
     -t "${FULL_IMAGE}" \
     -f "${REPO_ROOT}/gke/Dockerfile" \
     "${REPO_ROOT}"
