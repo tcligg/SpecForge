@@ -1,66 +1,46 @@
 """
-Re-generate training data using SGLang model servers, with preemption-safe
-chunk-based processing suitable for cloud environments (GKE spot + GCSFuse).
+This script will re-generate the dataset from target model,
+which better aligns the draft model with the target model's output distribution.
 
-Design
-------
-The input JSONL is split into fixed-size **chunks** (deterministic, based
-solely on line position and ``--chunk-size``).  Each chunk produces an
-independent output file, and a ``.done`` marker signals completion.
+Usage:
+1. Set up one or more SGLang servers for the target model.
 
-On resume (the default), chunks whose ``.done`` marker already exists are
-skipped.  If the process is preempted mid-chunk, the partial output is
-discarded and the chunk is retried from scratch on the next run — no data
-is silently lost.
+python3 -m sglang.launch_server \
+	--model Qwen/Qwen3.5-35B-A3B \
+	--mem-fraction-static 0.7 \
+	--tp 1 \
+	--trust-remote-code \
+    --cuda-graph-max-bs 128 \
+	--host 0.0.0.0 \
+	--port 30000 \
+	--dtype bfloat16 \
+    --reasoning-parser qwen3
 
-Multiple GKE pods can process the same input file in parallel by using
-``--shard-id`` / ``--total-shards``: each pod only processes chunks where
-``chunk_id % total_shards == shard_id``.
 
-Output layout::
-
-    {output-dir}/
-      chunk_000000.jsonl   # results for lines 0..chunk_size-1
-      chunk_000000.done    # marker: chunk 0 complete
-      chunk_000001.jsonl
-      chunk_000001.done
-      ...
-      errors/
-        chunk_000000_errors.jsonl
-        ...
-
-Usage
------
-1. Start SGLang server(s) for the target model.
-
-2. Run this script::
-
-    python scripts/regenerate_train_data.py \\
-        --model google/gemma-4-26b-a4b-it \\
-        --server-address localhost:30000 localhost:30010 \\
-        --input-file-path data/ultrachat_train.jsonl \\
-        --output-dir outputs/regen/ \\
-        --chunk-size 500 \\
-        --shard-id 0 --total-shards 4 \\
-        --concurrency 128 \\
-        --is-reasoning-model --thinking-ratio 0.7
-
-   On preemption, simply re-run the same command; completed chunks are
-   skipped automatically.
+2. Regenerate the dataset using the `regenerate_train_data.py` script.
+python scripts/regenerate_train_data.py \
+    --model Qwen/Qwen3.5-35B-A3B \
+    --concurrency 128 \
+    --max-tokens 4096 \
+    --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
+    --temperature 0.8 \
+    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
+    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
+    --resume \
+    --is-reasoning-model
 """
 
 import argparse
 import json
 import os
 import random
-import tempfile
 import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 from tqdm import tqdm
-
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -183,6 +163,18 @@ def parse_arguments():
         default=1,
         help="Total number of shards / workers (default: 1)",
     )
+    shard_group.add_argument(
+        "--chunk-ids",
+        type=str,
+        default=None,
+        help="Comma-separated explicit list of chunk IDs to process "
+        "(e.g. '4,5,6,7,12,13'). When set, overrides the default "
+        "modulo-based assignment: shard i of --total-shards processes "
+        "chunk_ids[j] for j where j %% total_shards == i. Used by the "
+        "rescue path to target only the chunks missing from a primary "
+        "job. When unset, default behavior is "
+        "chunk_id %% total_shards == shard_id.",
+    )
 
     # sglang server
     server_group = parser.add_argument_group("sglang server")
@@ -194,32 +186,7 @@ def parse_arguments():
         help="Server address(es) as host:port",
     )
 
-    # backward compat (ignored, resume is always on)
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=True,
-        help="(Ignored — resume is always enabled.) Kept for backward compatibility.",
-    )
-    # backward compat (output-file-path mapped to output-dir)
-    parser.add_argument(
-        "--output-file-path",
-        type=str,
-        default=None,
-        help="(Deprecated — use --output-dir instead.) "
-        "If provided, its parent directory is used as output-dir.",
-    )
-
     args = parser.parse_args()
-
-    # Handle backward compat: --output-file-path -> --output-dir
-    if args.output_file_path and not args.output_dir:
-        args.output_dir = os.path.dirname(args.output_file_path) or "."
-        print(
-            f"Warning: --output-file-path is deprecated. "
-            f"Using --output-dir={args.output_dir}"
-        )
-
     return args
 
 
@@ -479,10 +446,95 @@ def process_chunk(
 # ---------------------------------------------------------------------------
 
 
+def plan_chunks(args) -> Tuple[List[Tuple[int, List[str]]], int, int]:
+    """
+    Read the input file, split into chunks, assign chunks to this shard,
+    and filter out chunks already marked done.
+
+    Sharding rules:
+      - Default (no --chunk-ids): shard owns chunk_id where
+        chunk_id % args.total_shards == args.shard_id.
+      - With --chunk-ids: parse the explicit list, then within that list
+        shard owns chunk_ids[j] where j % args.total_shards == args.shard_id.
+        This is the rescue path: an external orchestrator computes the set
+        of missing chunk IDs and divides them among rescue workers.
+
+    Returns (pending_chunks, already_done, total_chunks):
+      pending_chunks: [(chunk_id, list_of_input_lines)] this shard must process
+      already_done:   number of this shard's chunks that already have .done
+                      markers (skipped this run)
+      total_chunks:   total chunks across all shards (for logging)
+    """
+    if args.chunk_size <= 0:
+        raise ValueError(f"--chunk-size must be > 0, got {args.chunk_size}")
+    if args.total_shards <= 0:
+        raise ValueError(f"--total-shards must be > 0, got {args.total_shards}")
+    if not (0 <= args.shard_id < args.total_shards):
+        raise ValueError(
+            f"--shard-id must be in [0, {args.total_shards}), got {args.shard_id}"
+        )
+
+    # Read input lines once (with optional --num-samples cap)
+    with open(args.input_file_path) as f:
+        lines = [line for line in f if line.strip()]
+    if args.num_samples is not None:
+        lines = lines[: args.num_samples]
+
+    # Slice into chunks of CHUNK_SIZE input lines each
+    all_chunks: List[Tuple[int, List[str]]] = [
+        (cid, lines[cid * args.chunk_size : (cid + 1) * args.chunk_size])
+        for cid in range((len(lines) + args.chunk_size - 1) // args.chunk_size)
+    ]
+    total_chunks = len(all_chunks)
+
+    # Assign chunks to this shard
+    if args.chunk_ids is None:
+        # Default: stride assignment by chunk_id modulo total_shards
+        my_chunks = [
+            (cid, payload)
+            for cid, payload in all_chunks
+            if cid % args.total_shards == args.shard_id
+        ]
+    else:
+        # Rescue path: explicit chunk-id list, then stride within that list
+        try:
+            requested = [int(x.strip()) for x in args.chunk_ids.split(",") if x.strip()]
+        except ValueError as e:
+            raise ValueError(
+                f"--chunk-ids must be a comma-separated list of integers "
+                f"(got {args.chunk_ids!r}): {e}"
+            )
+        max_cid = total_chunks - 1
+        for cid in requested:
+            if not (0 <= cid <= max_cid):
+                raise ValueError(
+                    f"--chunk-ids contains {cid}, which is outside "
+                    f"the valid range [0, {max_cid}] for this input file"
+                )
+        # Sort + dedupe so behavior is deterministic regardless of input order
+        requested = sorted(set(requested))
+        chunk_by_id = dict(all_chunks)
+        my_chunks = [
+            (cid, chunk_by_id[cid])
+            for j, cid in enumerate(requested)
+            if j % args.total_shards == args.shard_id
+        ]
+
+    # Drop chunks already marked done
+    pending_chunks = [
+        (cid, payload)
+        for cid, payload in my_chunks
+        if not is_chunk_done(args.output_dir, cid)
+    ]
+    already_done = len(my_chunks) - len(pending_chunks)
+
+    return pending_chunks, already_done, total_chunks
+
+
 def main():
     args = parse_arguments()
 
-    # Validate
+    # Validate sampling params
     if not (0.0 <= args.temperature <= 1.0):
         raise ValueError("Temperature must be between 0.0 and 1.0")
     if args.max_tokens <= 0:
@@ -492,71 +544,47 @@ def main():
             raise ValueError("--thinking-ratio must be between 0.0 and 1.0")
         if not args.is_reasoning_model:
             raise ValueError("--thinking-ratio requires --is-reasoning-model")
-    if not (0 <= args.shard_id < args.total_shards):
-        raise ValueError(
-            f"--shard-id must be in [0, {args.total_shards}), got {args.shard_id}"
-        )
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Read input and compute chunks
-    print("Reading input file...")
-    with open(args.input_file_path, "r") as f:
-        all_lines = f.readlines()
-    total_lines = len(all_lines)
-
-    if args.num_samples is not None:
-        all_lines = all_lines[: args.num_samples]
-        total_lines = len(all_lines)
-
-    # Build chunk list: [(chunk_id, [lines...]), ...]
-    chunks = []
-    for start in range(0, total_lines, args.chunk_size):
-        chunk_id = start // args.chunk_size
-        end = min(start + args.chunk_size, total_lines)
-        chunks.append((chunk_id, all_lines[start:end]))
-
-    total_chunks = len(chunks)
-
-    # Filter to this shard's chunks
-    my_chunks = [
-        (cid, lines)
-        for cid, lines in chunks
-        if cid % args.total_shards == args.shard_id
-    ]
-
-    # Filter out already-done chunks
-    pending_chunks = [
-        (cid, lines)
-        for cid, lines in my_chunks
-        if not is_chunk_done(args.output_dir, cid)
-    ]
-    already_done = len(my_chunks) - len(pending_chunks)
-
-    print("=" * 60)
-    print("  SpecForge Data Regeneration (chunk-based)")
-    print("=" * 60)
-    print(f"  Model:            {args.model}")
-    print(f"  Max tokens:       {args.max_tokens}")
-    print(f"  Temperature:      {args.temperature}")
+    print("Configuration:")
+    print(f"  Model:             {args.model}")
+    print(f"  Max tokens:        {args.max_tokens}")
+    print(f"  Concurrency:       {args.concurrency}")
+    print(f"  Temperature:       {args.temperature}")
     if args.thinking_ratio is not None:
         print(f"  Thinking ratio:   {args.thinking_ratio:.0%}")
-    print(f"  Concurrency:      {args.concurrency} per server")
-    print(f"  Servers:          {args.server_address}")
-    print(f"  Input file:       {args.input_file_path}")
-    print(f"  Output dir:       {args.output_dir}")
-    print(f"  Chunk size:       {args.chunk_size}")
-    print(f"  Total lines:      {total_lines}")
-    print(f"  Total chunks:     {total_chunks}")
-    print(f"  Shard:            {args.shard_id}/{args.total_shards}")
-    print(f"  My chunks:        {len(my_chunks)}")
-    print(f"  Already done:     {already_done}")
-    print(f"  Pending:          {len(pending_chunks)}")
-    print("=" * 60)
+    print(f"  Servers:           {args.server_address}")
+    print(f"  Input file:        {args.input_file_path}")
+    print(f"  Output dir:        {args.output_dir}")
+    print(f"  Chunk size:        {args.chunk_size}")
+    print(f"  Shard:             {args.shard_id}/{args.total_shards}")
+    if args.chunk_ids is not None:
+        # Truncate the printed list to keep logs readable
+        cids_preview = (
+            args.chunk_ids
+            if len(args.chunk_ids) <= 80
+            else (args.chunk_ids[:77] + "...")
+        )
+        print(f"  Explicit chunks:   {cids_preview}")
+    print("-" * 60)
+
+    # Make sure the output dir exists before any chunk write
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Plan: figure out which chunks this shard owns and which are still pending
+    pending_chunks, already_done, total_chunks = plan_chunks(args)
+
+    print(f"Planning:")
+    print(f"  Total chunks:      {total_chunks}")
+    print(f"  Owned by shard:    {len(pending_chunks) + already_done}")
+    print(f"  Already done:      {already_done}")
+    print(f"  Pending this run:  {len(pending_chunks)}")
+    print("-" * 60)
 
     if not pending_chunks:
-        print("All chunks already processed. Nothing to do.")
+        print(
+            f"Shard {args.shard_id}/{args.total_shards}: no pending chunks. "
+            f"Nothing to do."
+        )
         return
 
     # Validate server addresses

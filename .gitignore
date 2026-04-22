@@ -16,6 +16,13 @@ eggs/
 .eggs/
 lib/
 lib64/
+
+# Step 2 (gke/PLAN.md): the orchestrator helpers live in gke/lib/.
+# The stock `lib/` rule above (intended for venv lib/) would otherwise
+# silently ignore them. Negate the directory and the .py files only —
+# don't unignore __pycache__ etc.
+!gke/lib/
+!gke/lib/*.py
 parts/
 sdist/
 var/

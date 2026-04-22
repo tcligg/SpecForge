@@ -34,7 +34,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-exclude = ["configs*", "scripts*", "tests*"]
+exclude = ["configs*", "scripts*", "tests*", "gke*"]
 
 [project.optional-dependencies]
 dev = [
