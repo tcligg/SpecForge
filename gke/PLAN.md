@@ -442,3 +442,5 @@ gke/
 | 2026-04-22 | `Config` lives in `gke/lib/config.py`, not `gke/deploy.py` | Avoids circular import (deploy → lib → Config). Small departure from the step 2 spec; mechanical extraction otherwise |
 | 2026-04-22 | Drop underscore prefixes on extracted lib functions; `gke/deploy.py` re-exports old names as aliases | Cleaner public API for orchestrator; back-compat for any external `from gke.deploy import _foo` users |
 | 2026-04-22 | Add `gke/__init__.py` and exclude `gke*` from `pyproject.toml`'s `packages.find` | Explicit package (PEP 420 namespace packages misbehave with some tools); excluded so the `specforge` wheel does not ship operator tooling |
+| 2026-04-22 | State schema: top-level `RunState` dataclassed; per-dataset entries as plain dicts | Pragmatic balance — type safety where it pays (the always-present envelope), open-ended where shapes are still evolving (per-dataset records will gain fields in steps 6/7) |
+| 2026-04-22 | All GCS I/O via `gsutil` CLI subprocess (no `google-cloud-storage` dep) | Per PLAN's "no new Python deps" constraint; rest of the codebase already shells out to gsutil |
