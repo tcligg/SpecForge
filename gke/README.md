@@ -4,21 +4,39 @@ This directory contains the SpecForge data-regeneration pipeline that
 runs on GKE. Use this README when you are operating the system. For
 design rationale and the rebuild plan, see `gke/PLAN.md`.
 
-> **Status:** mid-rebuild. The current entrypoint is
-> `bash run_gke_regen.sh` → `python3 gke/deploy.py --execute`. After
-> the steps in `PLAN.md` land, the entrypoint becomes
-> `python3 gke/orchestrator.py run`. This README will be updated as
-> each step completes.
+> **Status:** mid-rebuild. As of step 4a the entrypoint is
+> `python3 gke/orchestrator.py run` (with `run_gke_regen.sh` reduced
+> to a thin wrapper). Phase A (prepare) runs natively; Phases B-E
+> still delegate to `gke/deploy.py --execute` until steps 4b/6 land.
+> The deploy CLI's `--status` and `--delete` subcommands stay as ops
+> shortcuts.
 
 ## Quick start (current state)
 
 ```bash
-# Full flow (build image, submit jobs across clusters, monitor, merge):
+# Full flow (prepare host-side, then build/deploy/monitor/merge):
+python3 gke/orchestrator.py run \
+    --config gke/regen-gemma3-27b.yaml \
+    --datasets perfectblend,magpie-multilingual \
+    --output-dir gs://tcli-llm-test/test-regen-data
+
+# Or, equivalent, via the wrapper:
 bash run_gke_regen.sh gke/regen-gemma3-27b.yaml \
     perfectblend,magpie-multilingual \
     gs://tcli-llm-test/test-regen-data
 
-# Just check status of running jobs:
+# Resume an existing run by id (state lives in
+# gs://<output-bucket>/<run-id>/state.json):
+python3 gke/orchestrator.py run \
+    --config gke/regen-gemma3-27b.yaml \
+    --run-id regen-gemma3-27b-20260422-160000
+
+# Inspect state for a run:
+python3 gke/orchestrator.py status \
+    --config gke/regen-gemma3-27b.yaml \
+    --run-id regen-gemma3-27b-20260422-160000
+
+# Just check live job status across clusters:
 python3 gke/deploy.py --yaml gke/regen-gemma3-27b.yaml --status
 
 # Kill all jobs for a config:

@@ -1,82 +1,46 @@
 #!/usr/bin/env bash
 #
-# One-command script to run the entire SpecForge data regeneration process on GKE.
+# Thin wrapper around gke/orchestrator.py. Step 4a of gke/PLAN.md.
 #
-# This script orchestrates the following steps by calling gke/deploy.py:
-#   1. Builds the Docker image and pushes it to Artifact Registry.
-#   2. Deletes any old jobs for the target datasets.
-#   3. Submits new regeneration jobs across multiple GKE clusters and GPU types.
-#   4. Waits for one job per dataset to acquire resources and start running.
-#   5. Monitors the winning jobs until they complete.
-#   6. Merges the chunked output files on GCS into a final, single file.
+# The previous version of this script invoked gke/deploy.py --execute
+# directly. The orchestrator now owns the entrypoint; Phase A (prepare)
+# runs natively here, and Phases B-E delegate to deploy.py until steps
+# 4b/6 land.
 #
 # Usage:
-#   bash run_gke_regen.sh [path/to/job-config.yaml] [dataset1,dataset2,...] [gs://output-bucket/path]
+#   bash run_gke_regen.sh <config.yaml> [datasets] [gs://output-bucket/path] [extra orchestrator args...]
 #
 # Example:
-#   bash run_gke_regen.sh gke/regen-gemma4-26b.yaml ultrachat,perfectblend gs://my-bucket/output
+#   bash run_gke_regen.sh gke/regen-gemma3-27b.yaml \
+#       perfectblend,magpie-multilingual gs://my-bucket/output
 #
-# If arguments are omitted, they will be prompted for interactively.
+# Resume an existing run (pass empty placeholders to keep positional args aligned):
+#   bash run_gke_regen.sh gke/regen-gemma3-27b.yaml "" "" --run-id <id>
 
 set -euo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-DEPLOY_SCRIPT="${SCRIPT_DIR}/gke/deploy.py"
+ORCH="${SCRIPT_DIR}/gke/orchestrator.py"
 
-if [ ! -f "${DEPLOY_SCRIPT}" ]; then
-    echo "Error: deploy.py not found at ${DEPLOY_SCRIPT}"
+if [ ! -f "${ORCH}" ]; then
+    echo "Error: orchestrator not found at ${ORCH}" >&2
     exit 1
 fi
 
 JOB_YAML="${1:-}"
 DATASETS="${2:-}"
 OUTPUT_DIR="${3:-}"
+[ "$#" -ge 1 ] && shift
+[ "$#" -ge 1 ] && shift
+[ "$#" -ge 1 ] && shift
 
-# Interactive prompt if YAML is not provided
 if [ -z "${JOB_YAML}" ]; then
-    echo "Please select the job YAML to run:"
-    YAMLS=($(find "${SCRIPT_DIR}/gke" -name "regen-*.yaml" -printf "%f
-"))
-    select y in "${YAMLS[@]}"; do
-        if [ -n "$y" ]; then
-            JOB_YAML="gke/${y}"
-            break
-        fi
-    done
+    echo "Usage: $0 <config.yaml> [datasets] [gs://output] [--run-id ID ...]" >&2
+    exit 1
 fi
 
-# Interactive prompt if datasets are not provided
-if [ -z "${DATASETS}" ]; then
-    # Extract default datasets from the chosen YAML
-    DEFAULT_DS=$(grep -A1 'name: DATASETS' "${JOB_YAML}" | grep 'value:' | sed 's/.*value: "\(.*\)"/\1/')
-    read -p "Enter comma-separated datasets to regenerate [${DEFAULT_DS}]: " DATASETS_INPUT
-    DATASETS="${DATASETS_INPUT:-${DEFAULT_DS}}"
-fi
+ARGS=(run --config "${JOB_YAML}")
+[ -n "${DATASETS}" ] && ARGS+=(--datasets "${DATASETS}")
+[ -n "${OUTPUT_DIR}" ] && ARGS+=(--output-dir "${OUTPUT_DIR}")
 
-# Build the command arguments
-CMD_ARGS=(--yaml "${JOB_YAML}" --datasets "${DATASETS}" --execute)
-if [ -n "${OUTPUT_DIR}" ]; then
-    CMD_ARGS+=(--output-dir "${OUTPUT_DIR}")
-fi
-
-echo ""
-echo "============================================================"
-echo "  Starting SpecForge GKE Regeneration"
-echo "============================================================"
-echo "  Job YAML: ${JOB_YAML}"
-echo "  Datasets: ${DATASETS}"
-if [ -n "${OUTPUT_DIR}" ]; then
-    echo "  Output Dir: ${OUTPUT_DIR}"
-fi
-echo "============================================================"
-echo ""
-
-# Execute the end-to-end process
-python3 "${DEPLOY_SCRIPT}" "${CMD_ARGS[@]}"
-
-echo ""
-echo "============================================================"
-echo "  All tasks complete."
-echo "============================================================"
-echo ""
-
+exec python3 "${ORCH}" "${ARGS[@]}" "$@"

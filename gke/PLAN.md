@@ -112,7 +112,7 @@ Mark step status here when landed:
 - [x] **Step 1** — restore chunk-sharding in `scripts/regenerate_train_data.py` + add `--chunk-ids` hook
 - [x] **Step 2** — refactor `gke/deploy.py` into `gke/lib/*` + thin CLI shim
 - [x] **Step 3** — add `gke/state.py` as no-op observer in current `--execute` flow
-- [ ] **Step 4a** — `gke/orchestrator.py` scaffold + Phase A (prepare)
+- [x] **Step 4a** — `gke/orchestrator.py` scaffold + Phase A (prepare); `run_gke_regen.sh` reduced to wrapper
 - [ ] **Step 4b** — add Phase B (build) and Phase E (merge)
 - [ ] **Step 5** — `gke/scheduling.py` (pending-reason classifier) behind feature flag
 - [ ] **Step 6** — move Phases C/D into orchestrator with strict scheduling
@@ -444,3 +444,8 @@ gke/
 | 2026-04-22 | Add `gke/__init__.py` and exclude `gke*` from `pyproject.toml`'s `packages.find` | Explicit package (PEP 420 namespace packages misbehave with some tools); excluded so the `specforge` wheel does not ship operator tooling |
 | 2026-04-22 | State schema: top-level `RunState` dataclassed; per-dataset entries as plain dicts | Pragmatic balance — type safety where it pays (the always-present envelope), open-ended where shapes are still evolving (per-dataset records will gain fields in steps 6/7) |
 | 2026-04-22 | All GCS I/O via `gsutil` CLI subprocess (no `google-cloud-storage` dep) | Per PLAN's "no new Python deps" constraint; rest of the codebase already shells out to gsutil |
+| 2026-04-22 | Step 4a: `run` always starts a fresh run unless `--run-id` given | Auto-discovery (latest state.json by config_hash) is more code and more failure modes; defer until step 6. `--new` is accepted but redundant in this step (kept for forward compat) |
+| 2026-04-22 | Step 4a: state URI auto-derived from YAML `OUTPUT_DIR` mount | YAML already encodes the bucket via `OUTPUT_DIR: /gcs/<bucket>/...`. Mapping to `gs://<bucket>/.../<run_id>/state.json` matches PLAN's "co-located with output" rule and avoids a redundant flag on the common path. `--state-uri` overrides for ops |
+| 2026-04-22 | Step 4a: orchestrator delegates Phases B/C/D/E to `gke/deploy.py --execute` as one unit | Smallest landable change. Each native phase replaces its slice of the delegated call in steps 4b (build/merge) and 6 (deploy/monitor). Threads `--state-uri` so the step-3 observer keeps populating state |
+| 2026-04-22 | Separate `OrchestratorConfig` (in `gke/orchestrator.py`) from `gke.lib.config.Config` | Different inputs (orchestrator owns run identity, state URI, resume flags). When B/C/D/E go native the deploy `Config` shrinks; keeping them split now avoids a churnful merge later |
+| 2026-04-22 | Step 4a: stub subcommands (`logs`, `cancel`, `cleanup`, `rescue`) hard-exit with a pointer | Reserves the CLI surface so users see "this is coming" instead of `unknown command`, without committing to behavior we haven't designed |
