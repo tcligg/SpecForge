@@ -30,11 +30,13 @@ import re
 # project root is on sys.path before importing the gke.lib package.
 import sys
 from pathlib import Path
+from typing import Optional
 
 _PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from gke import state as _state
 from gke.lib.build import build_and_push_image
 from gke.lib.clusters import use_cluster
 from gke.lib.config import Config
@@ -142,12 +144,79 @@ def cmd_deploy(cfg: Config):
     print("=" * 60)
 
 
+# ---------------------------------------------------------------------------
+# State observer (step 3 of gke/PLAN.md)
+#
+# When --state-uri is set, cmd_execute writes a per-phase observer
+# record to the GCS path. This is *pure observation*: failures to write
+# state never break the workflow, and nothing reads state in step 3.
+# Step 4 starts using the read path.
+# ---------------------------------------------------------------------------
+
+
+def _make_state_store(cfg: Config) -> Optional["_state.StateStore"]:
+    """Construct a StateStore if --state-uri was provided, else None.
+
+    Construction errors (bad URI) are logged and swallowed: state
+    collection is opt-in and must not block the workflow.
+    """
+    if not cfg.state_uri:
+        return None
+    try:
+        return _state.StateStore(cfg.state_uri)
+    except _state.StateError as exc:
+        print(f"  Warning: --state-uri rejected, state collection disabled: {exc}")
+        return None
+
+
+def _observe(
+    store: Optional["_state.StateStore"],
+    fn,
+    *,
+    label: str,
+) -> None:
+    """Apply a state mutation through the store, swallowing errors.
+
+    Pure-observer contract: a state-write failure prints a warning and
+    returns; it must never propagate up into the workflow loop.
+    """
+    if store is None:
+        return
+    try:
+        store.update(fn)
+    except _state.StateError as exc:
+        print(f"  Warning: state {label}: {exc}")
+
+
 def cmd_execute(cfg: Config):
-    """End-to-end workflow: build, push, deploy, wait, merge."""
+    """End-to-end workflow: build, push, deploy, wait, merge.
+
+    When --state-uri is set, writes an observer record to the configured
+    GCS path at each phase boundary (build/deploy/monitor/merge). State
+    is write-only in step 3; the orchestrator added in step 4 is the
+    first reader.
+    """
     print()
     print("============================================================")
     print("  Executing End-to-End Regeneration Workflow")
     print("============================================================")
+
+    # 0. Initialize state observer (optional, gated on --state-uri).
+    store = _make_state_store(cfg)
+    if store is not None:
+        try:
+            run_id = _state.compute_run_id(cfg.base_name or "regen")
+            initial = _state.initial_state(
+                run_id=run_id,
+                config_yaml=cfg.job_yaml,
+                config_hash=_state.compute_config_hash(cfg.job_yaml),
+            )
+            store.write(initial)
+            print(f"  State: writing observer records to {cfg.state_uri}")
+            print(f"  Run ID: {run_id}")
+        except _state.StateError as exc:
+            print(f"  Warning: state init failed; continuing without it: {exc}")
+            store = None
 
     # 1. Build and push image, update YAML
     new_image_uri = build_and_push_image(cfg)
@@ -157,6 +226,17 @@ def cmd_execute(cfg: Config):
     with open(cfg.job_yaml, "w") as f:
         f.write(content)
     print(f"Updated {cfg.job_yaml} to use image {new_image_uri}")
+
+    def _record_build(s: "_state.RunState") -> "_state.RunState":
+        s.phases.build = _state.BuildPhase(
+            image_uri=new_image_uri,
+            git_sha="",  # populated in step 4b when Phase B is host-side
+            dirty=False,
+            completed_at=_state._utc_now_iso(),
+        )
+        return s
+
+    _observe(store, _record_build, label="build")
 
     # 2. Delete any old jobs
     cmd_delete(cfg)
@@ -169,14 +249,71 @@ def cmd_execute(cfg: Config):
             continue
 
         job_name, cluster, region = winner_job
+
+        def _record_deploy(
+            s: "_state.RunState",
+            *,
+            ds=ds,
+            job_name=job_name,
+            cluster=cluster,
+            region=region,
+        ) -> "_state.RunState":
+            s.phases.deploy[ds] = {
+                "primary_job": {
+                    "cluster": cluster,
+                    "region": region,
+                    # GPU type is not surfaced by deploy_dataset's return
+                    # value; recover it from the job_name suffix.
+                    "gpu": "",
+                    "job_name": job_name,
+                    "total_shards": cfg.total_pods,
+                    "started_at": _state._utc_now_iso(),
+                }
+            }
+            return s
+
+        _observe(store, _record_deploy, label=f"deploy[{ds}]")
+
         print(f"  Monitoring job {job_name} in {cluster}...")
         success = wait_for_job_completion(job_name, cluster, region, cfg)
+
+        def _record_monitor(
+            s: "_state.RunState",
+            *,
+            ds=ds,
+            success=success,
+        ) -> "_state.RunState":
+            s.phases.monitor[ds] = {
+                "primary_job_status": "Complete" if success else "Failed",
+                # Per-shard status arrives in step 6 once we read
+                # .status.completedIndexes; record empty for now.
+                "shard_status": {},
+            }
+            return s
+
+        _observe(store, _record_monitor, label=f"monitor[{ds}]")
+
         if not success:
             print(f"  Error: Job {job_name} failed or timed out. Skipping merge.")
             continue
 
         print(f"  Job {job_name} completed. Merging output chunks...")
         merge_output_chunks(cfg, ds)
+
+        def _record_merge(
+            s: "_state.RunState",
+            *,
+            ds=ds,
+        ) -> "_state.RunState":
+            # The current merge_output_chunks doesn't return chunk count
+            # or merged-file URI; record a minimal completion marker.
+            # Step 4b's Phase E rewrite will populate the full schema.
+            s.phases.merge[ds] = {
+                "completed_at": _state._utc_now_iso(),
+            }
+            return s
+
+        _observe(store, _record_merge, label=f"merge[{ds}]")
 
     print()
     print("============================================================")
@@ -233,6 +370,13 @@ def main():
         type=int,
         default=3600,
         help="Seconds to wait per dataset for scheduling (default: 3600)",
+    )
+    parser.add_argument(
+        "--state-uri",
+        default=None,
+        help="Optional gs://bucket/path/state.json to write per-phase "
+        "observer records. Step 3 of gke/PLAN.md: write-only; the "
+        "orchestrator added in step 4 starts using the read path.",
     )
 
     # Command flags (mutually exclusive)

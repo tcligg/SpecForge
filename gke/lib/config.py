@@ -35,6 +35,10 @@ class Config:
     base_name: str = ""
     total_pods: int = 8
     min_running: int = 4
+    # Optional GCS URI (gs://bucket/path/state.json) where cmd_execute
+    # writes a per-phase observer record. Step 3 only writes; step 4+
+    # starts reading. None means state collection is disabled.
+    state_uri: Optional[str] = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
@@ -50,6 +54,7 @@ class Config:
         cfg.output_dir = args.output_dir
         cfg.datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
         cfg.gpu_types = [g.strip() for g in args.gpu_types.split(",") if g.strip()]
+        cfg.state_uri = getattr(args, "state_uri", None)
 
         # Validate JOB_YAML
         if not cfg.job_yaml:

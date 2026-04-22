@@ -111,7 +111,7 @@ Mark step status here when landed:
 - [x] **Step 0** — docs scaffolding (this file, `gke/README.md`, `AGENTS.md` update)
 - [x] **Step 1** — restore chunk-sharding in `scripts/regenerate_train_data.py` + add `--chunk-ids` hook
 - [x] **Step 2** — refactor `gke/deploy.py` into `gke/lib/*` + thin CLI shim
-- [ ] **Step 3** — add `gke/state.py` as no-op observer in current `--execute` flow
+- [x] **Step 3** — add `gke/state.py` as no-op observer in current `--execute` flow
 - [ ] **Step 4a** — `gke/orchestrator.py` scaffold + Phase A (prepare)
 - [ ] **Step 4b** — add Phase B (build) and Phase E (merge)
 - [ ] **Step 5** — `gke/scheduling.py` (pending-reason classifier) behind feature flag
@@ -189,6 +189,32 @@ Pure observer.
 - Round-trip a `RunState` against a real GCS bucket.
 - Run current `--execute` with `--state-uri`, inspect resulting JSON.
 - Concurrent `update()` test: second writer retries cleanly.
+
+**Manual smoke against real GCS** (run once after step 3 lands; not in CI):
+
+```bash
+# Round-trip + concurrent-update check.
+URI=gs://tcli-llm-test/test-state/$(date +%s).json
+python3 - <<'PY'
+import os
+from gke import state
+uri = os.environ["URI"]
+store = state.StateStore(uri)
+s = state.initial_state("smoke-1", "gke/regen-gemma3-27b.yaml", "sha256:0")
+store.write(s)
+loaded = store.read()
+assert loaded.run_id == "smoke-1"
+
+def add_image(s):
+    s.phases.build = state.BuildPhase(image_uri="img:1", git_sha="abc",
+                                       dirty=False, completed_at="now")
+    return s
+store.update(add_image)
+print("round-trip OK; final state:")
+print(store.read().to_json())
+PY
+gsutil rm "$URI"
+```
 
 ### Step 4a — Orchestrator scaffold + Phase A
 
