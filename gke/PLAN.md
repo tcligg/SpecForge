@@ -109,7 +109,7 @@ One PR per step, merged to `eagle3`. Branch naming:
 Mark step status here when landed:
 
 - [x] **Step 0** — docs scaffolding (this file, `gke/README.md`, `AGENTS.md` update)
-- [ ] **Step 1** — restore chunk-sharding in `scripts/regenerate_train_data.py` + add `--chunk-ids` hook
+- [x] **Step 1** — restore chunk-sharding in `scripts/regenerate_train_data.py` + add `--chunk-ids` hook
 - [ ] **Step 2** — refactor `gke/deploy.py` into `gke/lib/*` + thin CLI shim
 - [ ] **Step 3** — add `gke/state.py` as no-op observer in current `--execute` flow
 - [ ] **Step 4a** — `gke/orchestrator.py` scaffold + Phase A (prepare)
