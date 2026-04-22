@@ -116,13 +116,18 @@ def cmd_deploy(cfg: Config):
     print("  GKE Multi-Dataset Deploy")
     print("=" * 60)
 
+    # Pull the first non-comment ``image:`` key. After step 4b the
+    # YAMLs carry an explanatory comment that includes ``image:``;
+    # match against a leading-whitespace line so we skip it.
+    image = "unknown"
     with open(cfg.job_yaml) as f:
         for line in f:
-            if "image:" in line:
-                image = line.strip().split("image:")[-1].strip()
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if "image:" in line and not stripped.startswith("- "):
+                image = line.strip().split("image:", 1)[-1].strip()
                 break
-        else:
-            image = "unknown"
 
     print(f"  Project:    {cfg.project}")
     print(f"  YAML:       {cfg.job_yaml}")
@@ -222,7 +227,16 @@ def cmd_execute(cfg: Config):
     new_image_uri = build_and_push_image(cfg)
     with open(cfg.job_yaml) as f:
         content = f.read()
-    content = re.sub(r"(image:\s*)(\S+)", rf"\g<1>{new_image_uri}", content, count=1)
+    # Match the first non-comment ``image:`` key. Step 4b unpinned the
+    # YAMLs and added an explanatory comment that contains the literal
+    # ``image:`` substring; without the line anchor + leading-whitespace
+    # constraint we'd rewrite the comment instead.
+    content = re.sub(
+        r"(?m)^(?P<lead>[ \t]+image:[ \t]*)\S+",
+        rf"\g<lead>{new_image_uri}",
+        content,
+        count=1,
+    )
     with open(cfg.job_yaml, "w") as f:
         f.write(content)
     print(f"Updated {cfg.job_yaml} to use image {new_image_uri}")

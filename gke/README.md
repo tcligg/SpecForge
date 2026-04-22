@@ -4,12 +4,18 @@ This directory contains the SpecForge data-regeneration pipeline that
 runs on GKE. Use this README when you are operating the system. For
 design rationale and the rebuild plan, see `gke/PLAN.md`.
 
-> **Status:** mid-rebuild. As of step 4a the entrypoint is
+> **Status:** mid-rebuild. As of step 4b the entrypoint is
 > `python3 gke/orchestrator.py run` (with `run_gke_regen.sh` reduced
-> to a thin wrapper). Phase A (prepare) runs natively; Phases B-E
-> still delegate to `gke/deploy.py --execute` until steps 4b/6 land.
-> The deploy CLI's `--status` and `--delete` subcommands stay as ops
-> shortcuts.
+> to a thin wrapper). Phases A/B/E run natively; C/D use the helpers
+> in `gke.lib.{orchestration,k8s}` directly (legacy candidate-racing,
+> until step 6 swaps in strict scheduling). The deploy CLI is now
+> only used for `--status` / `--delete` ops shortcuts.
+>
+> Phase B skips the docker build when the computed `<git-sha>` (or
+> `<sha>-dirty<hash>`) tag is already present in Artifact Registry;
+> pass `--force-rebuild` to override. The regen YAMLs no longer pin
+> a real `image:` tag — the orchestrator writes the resolved tag at
+> run time.
 
 ## Quick start (current state)
 
@@ -139,8 +145,12 @@ build time.
 
 ### `gsutil compose` fails with "max 1024 components"
 
-Dataset has more than 1024 chunks. Today: silent truncation (data
-loss). After step 4b: recursive compose handles arbitrary chunk counts.
+Fixed in step 4b: `gke.lib.merge.compose_dataset_chunks` recursively
+batches at 1000 components per call, composes intermediates into a
+final object, and verifies the merged line count against the sum of
+`success` counts in the per-chunk `.done` markers. Mismatches are
+recorded in state as `merge[ds].status = "unverified"` rather than
+raising.
 
 ### Pod is `Running` but never produces chunks
 

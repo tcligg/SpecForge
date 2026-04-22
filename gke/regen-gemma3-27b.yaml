@@ -54,7 +54,10 @@ spec:
         cloud.google.com/gke-gpu-driver-version: "latest"
       containers:
       - name: regen
-        image: us-central1-docker.pkg.dev/cloud-llm-test/tcli-test/specforge-regen:20260418-011202
+        # image: rewritten by gke/orchestrator.py Phase B at run time.
+        # The placeholder below keeps the file kubectl-applyable when
+        # debugging by hand; do not rely on this tag in production.
+        image: us-central1-docker.pkg.dev/cloud-llm-test/tcli-test/specforge-regen:UNPINNED
         resources:
           limits:
             nvidia.com/gpu: 8
