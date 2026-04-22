@@ -110,7 +110,7 @@ Mark step status here when landed:
 
 - [x] **Step 0** — docs scaffolding (this file, `gke/README.md`, `AGENTS.md` update)
 - [x] **Step 1** — restore chunk-sharding in `scripts/regenerate_train_data.py` + add `--chunk-ids` hook
-- [ ] **Step 2** — refactor `gke/deploy.py` into `gke/lib/*` + thin CLI shim
+- [x] **Step 2** — refactor `gke/deploy.py` into `gke/lib/*` + thin CLI shim
 - [ ] **Step 3** — add `gke/state.py` as no-op observer in current `--execute` flow
 - [ ] **Step 4a** — `gke/orchestrator.py` scaffold + Phase A (prepare)
 - [ ] **Step 4b** — add Phase B (build) and Phase E (merge)
@@ -412,3 +412,7 @@ gke/
 | 2026-04-22 | Sleep-retry on spot exhausted (not on-demand fallback) | Cheapest; revisit if hit often |
 | 2026-04-22 | `prepare_data.py` runs host-side | GCE workstation has bandwidth |
 | 2026-04-22 | `run` blocks until completion | Simplest UX; background with `&` |
+| 2026-04-22 | Steps 1+2 land on the same branch / PR | Iterating on a working branch toward `eagle3`; not actually opening per-step PRs |
+| 2026-04-22 | `Config` lives in `gke/lib/config.py`, not `gke/deploy.py` | Avoids circular import (deploy → lib → Config). Small departure from the step 2 spec; mechanical extraction otherwise |
+| 2026-04-22 | Drop underscore prefixes on extracted lib functions; `gke/deploy.py` re-exports old names as aliases | Cleaner public API for orchestrator; back-compat for any external `from gke.deploy import _foo` users |
+| 2026-04-22 | Add `gke/__init__.py` and exclude `gke*` from `pyproject.toml`'s `packages.find` | Explicit package (PEP 420 namespace packages misbehave with some tools); excluded so the `specforge` wheel does not ship operator tooling |

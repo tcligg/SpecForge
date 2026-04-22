@@ -7,255 +7,49 @@ For each dataset, the script:
   3. Waits until one combination has enough pods Running.
   4. Deletes the job from all other combinations.
   5. Moves on to the next dataset.
+
 Usage:
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --status
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --delete
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --execute
   python gke/deploy.py --yaml gke/regen-gemma4-26b.yaml --gpu-types nvidia-h100-80gb
+
+NOTE (step 2 of gke/PLAN.md): the implementation has been split into
+gke/lib/* modules. This file is now a thin CLI shim that wires argparse
+to the library helpers. Step 6 will replace this CLI entirely with
+gke/orchestrator.py.
 """
 
+from __future__ import annotations
+
 import argparse
-import glob
-import os
 import re
-import subprocess
+
+# Import paths: deploy.py runs as a top-level script, so make sure the
+# project root is on sys.path before importing the gke.lib package.
 import sys
-import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
 
+_PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
+from gke.lib.build import build_and_push_image
+from gke.lib.clusters import use_cluster
+from gke.lib.config import Config
+from gke.lib.k8s import get_pod_status, run_output, wait_for_job_completion
+from gke.lib.merge import merge_output_chunks
+from gke.lib.orchestration import deploy_dataset
+from gke.lib.yaml_patch import gpu_short_name, make_job_name
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Config:
-    project: str = "cloud-llm-test"
-    schedule_timeout: int = 3600
-    job_yaml: str = ""
-    output_dir: Optional[str] = None
-    datasets: List[str] = field(default_factory=list)
-    gpu_types: List[str] = field(default_factory=list)
-    clusters: List[Tuple[str, str]] = field(default_factory=list)
-    base_name: str = ""
-    total_pods: int = 8
-    min_running: int = 4
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "Config":
-        cfg = cls()
-        cfg.project = args.project
-        cfg.schedule_timeout = args.timeout
-        cfg.job_yaml = args.yaml
-        cfg.output_dir = args.output_dir
-        cfg.datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
-        cfg.gpu_types = [g.strip() for g in args.gpu_types.split(",") if g.strip()]
-
-        # Validate JOB_YAML
-        if not cfg.job_yaml:
-            available = sorted(glob.glob(str(SCRIPT_DIR / "regen-*.yaml")))
-            print("Error: --yaml is required. Available YAMLs:")
-            for f in available:
-                print(f"  {f}")
-            sys.exit(1)
-
-        if not os.path.isfile(cfg.job_yaml):
-            print(f"Error: {cfg.job_yaml} not found.")
-            sys.exit(1)
-
-        # Parse YAML for base name and completions
-        with open(cfg.job_yaml) as f:
-            yaml_content = f.read()
-
-        match = re.search(r"^\s*name:\s*(\S+)", yaml_content, re.MULTILINE)
-        cfg.base_name = match.group(1) if match else "regen"
-
-        match = re.search(r"completions:\s*(\d+)", yaml_content)
-        cfg.total_pods = int(match.group(1)) if match else 8
-        cfg.min_running = (cfg.total_pods + 1) // 2
-
-        # Discover or parse clusters
-        if args.clusters:
-            cfg.clusters = []
-            for entry in args.clusters.split(","):
-                entry = entry.strip()
-                if ":" in entry:
-                    name, region = entry.split(":", 1)
-                    cfg.clusters.append((name.strip(), region.strip()))
-        else:
-            cfg.clusters = discover_clusters(cfg.project)
-
-        return cfg
-
-
-# ---------------------------------------------------------------------------
-# Shell helpers
-# ---------------------------------------------------------------------------
-
-
-def run_output(cmd: List[str]) -> str:
-    """Run a command and return stdout, empty string on failure."""
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
-
-
-def discover_clusters(project: str) -> List[Tuple[str, str]]:
-    """Auto-discover pyc-batch* clusters, excluding pyc-batch-us-south1."""
-    print(f"Discovering pyc-batch* clusters in project {project}...")
-    output = run_output(
-        [
-            "gcloud",
-            "container",
-            "clusters",
-            "list",
-            "--project",
-            project,
-            "--filter",
-            "name~^pyc-batch AND NOT name=pyc-batch-us-south1",
-            "--format",
-            "csv[no-heading](name,location)",
-        ]
-    )
-    if not output:
-        print(f"Error: No pyc-batch* clusters found in project {project}.")
-        sys.exit(1)
-
-    clusters = []
-    for line in output.splitlines():
-        parts = line.strip().split(",")
-        if len(parts) == 2:
-            clusters.append((parts[0].strip(), parts[1].strip()))
-    return clusters
-
-
-def use_cluster(cluster: str, region: str, project: str) -> bool:
-    """Switch kubectl context to a cluster."""
-    result = subprocess.run(
-        [
-            "gcloud",
-            "container",
-            "clusters",
-            "get-credentials",
-            cluster,
-            "--region",
-            region,
-            "--project",
-            project,
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
-def get_pod_status(job_name: str) -> Tuple[int, int, int]:
-    """Get (running, pending, other) pod counts for a job."""
-    output = run_output(
-        [
-            "kubectl",
-            "get",
-            "pods",
-            "-l",
-            f"job-name={job_name}",
-            "--no-headers",
-        ]
-    )
-    running = pending = other = 0
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) >= 3:
-            status = parts[2]
-            if status == "Running":
-                running += 1
-            elif status == "Pending":
-                pending += 1
-            else:
-                other += 1
-    return running, pending, other
-
-
-def gpu_short_name(gpu_type: str) -> str:
-    """nvidia-h200-141gb -> h200"""
-    return gpu_type.replace("nvidia-", "").split("-")[0]
-
-
-def make_job_name(base: str, dataset: str, gpu_type: str, region: str) -> str:
-    """e.g. regen-gemma4-26b-perfectblend-h200-europe-west1"""
-    return f"{base}-{dataset}-{gpu_short_name(gpu_type)}-{region}"
-
-
-def patch_and_apply_yaml(
-    cfg: Config,
-    dataset: str,
-    gpu_type: str,
-    region: str,
-) -> Tuple[bool, str]:
-    """Patch YAML and apply via kubectl. Returns (success, error_message)."""
-    job_name = make_job_name(cfg.base_name, dataset, gpu_type, region)
-
-    with open(cfg.job_yaml) as f:
-        content = f.read()
-
-    # Patch job name (first occurrence)
-    content = content.replace(f"name: {cfg.base_name}", f"name: {job_name}", 1)
-
-    # Patch DATASETS value and GPU type
-    lines = content.splitlines()
-    patched_lines = []
-    in_datasets_env = False
-    in_output_dir_env = False
-
-    for line in lines:
-        if in_datasets_env and "value:" in line:
-            line = re.sub(r'value: ".*"', f'value: "{dataset}"', line)
-            in_datasets_env = False
-        elif in_output_dir_env and "value:" in line and cfg.output_dir:
-            # Convert gs://bucket/path -> /gcs/bucket/path
-            gcs_path = cfg.output_dir.replace("gs://", "/gcs/")
-            line = re.sub(r'value: ".*"', f'value: "{gcs_path}"', line)
-            in_output_dir_env = False
-
-        if "name: DATASETS" in line:
-            in_datasets_env = True
-        elif "name: OUTPUT_DIR" in line:
-            in_output_dir_env = True
-
-        if "gke-accelerator:" in line and "accelerator-count" not in line:
-            line = re.sub(r"gke-accelerator: .*", f"gke-accelerator: {gpu_type}", line)
-
-        patched_lines.append(line)
-
-    patched_content = "\n".join(patched_lines) + "\n"
-
-    result = subprocess.run(
-        ["kubectl", "apply", "-f", "-"],
-        input=patched_content,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return False, result.stderr.strip()
-    return True, ""
-
-
-def delete_job(job_name: str) -> bool:
-    """Delete a job, returns True if successful."""
-    result = subprocess.run(
-        ["kubectl", "delete", "job", job_name, "--ignore-not-found"],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
+# Backward-compatible aliases for the underscore-prefixed names that
+# step 2 dropped. Keeping these so any external caller that did
+# `from gke.deploy import _build_and_push_image` keeps working until
+# step 8 deletes the CLI entirely.
+_build_and_push_image = build_and_push_image
+_merge_output_chunks = merge_output_chunks
+_wait_for_job_completion = wait_for_job_completion
 
 
 # ---------------------------------------------------------------------------
@@ -315,96 +109,6 @@ def cmd_delete(cfg: Config):
     print("Done.")
 
 
-def deploy_dataset(cfg: Config, dataset: str) -> Optional[Tuple[str, str, str]]:
-    """
-    Deploy a single dataset across all (cluster x gpu_type) combos.
-    Returns the (job_name, cluster, region) of the winning job, or None.
-    """
-    print()
-    print("=" * 60)
-    print(f"  Deploying: {dataset}")
-    print(f"  GPU types: {', '.join(gpu_short_name(g) for g in cfg.gpu_types)}")
-    print("=" * 60)
-
-    # Phase 1: Submit to all combinations
-    submitted: List[Tuple[str, str, str]] = []
-
-    for gpu in cfg.gpu_types:
-        for cluster, region in cfg.clusters:
-            job_name = make_job_name(cfg.base_name, dataset, gpu, region)
-
-            if not use_cluster(cluster, region, cfg.project):
-                print(f"  {cluster}: failed to connect, skipping.")
-                continue
-
-            success, err = patch_and_apply_yaml(
-                cfg,
-                dataset,
-                gpu,
-                region,
-            )
-            if success:
-                print(f"  {job_name}: submitted.")
-                submitted.append((cluster, region, gpu))
-            else:
-                print(f"  {job_name}: kubectl apply failed, skipping.")
-                for line in err.splitlines()[:5]:
-                    print(f"    {line}")
-
-    if not submitted:
-        print(f"  Error: Failed to submit {dataset} to any cluster.")
-        return None
-
-    # Phase 2: Wait for pods to schedule
-    print(f"  Waiting up to {cfg.schedule_timeout}s for pods to schedule...")
-
-    elapsed = 0
-    winner: Optional[Tuple[str, str, str]] = None
-
-    while elapsed < cfg.schedule_timeout:
-        for cluster, region, gpu in submitted:
-            job_name = make_job_name(cfg.base_name, dataset, gpu, region)
-
-            if not use_cluster(cluster, region, cfg.project):
-                continue
-
-            running, pending, other = get_pod_status(job_name)
-
-            if running >= cfg.min_running:
-                winner = (cluster, region, gpu)
-                break
-
-        if winner:
-            break
-
-        print(f"  [{elapsed}s] No fully scheduled cluster yet...")
-        time.sleep(30)
-        elapsed += 30
-
-    if not winner:
-        print(
-            f"  Warning: {dataset} not scheduled within "
-            f"{cfg.schedule_timeout}s. Jobs remain submitted."
-        )
-        return None
-
-    # Phase 3: Keep winner, delete the rest
-    win_cluster, win_region, win_gpu = winner
-    winner_name = make_job_name(cfg.base_name, dataset, win_gpu, win_region)
-    print(f"  Scheduled on: {winner_name}")
-
-    for cluster, region, gpu in submitted:
-        if (cluster, region, gpu) == winner:
-            continue
-        job_name = make_job_name(cfg.base_name, dataset, gpu, region)
-        if use_cluster(cluster, region, cfg.project):
-            delete_job(job_name)
-            print(f"  {job_name}: deleted.")
-
-    print(f"  {dataset} -> {winner_name} ({win_cluster}, {gpu_short_name(win_gpu)})")
-    return winner_name, win_cluster, win_region
-
-
 def cmd_deploy(cfg: Config):
     print("=" * 60)
     print("  GKE Multi-Dataset Deploy")
@@ -446,7 +150,7 @@ def cmd_execute(cfg: Config):
     print("============================================================")
 
     # 1. Build and push image, update YAML
-    new_image_uri = _build_and_push_image(cfg)
+    new_image_uri = build_and_push_image(cfg)
     with open(cfg.job_yaml) as f:
         content = f.read()
     content = re.sub(r"(image:\s*)(\S+)", rf"\g<1>{new_image_uri}", content, count=1)
@@ -466,136 +170,18 @@ def cmd_execute(cfg: Config):
 
         job_name, cluster, region = winner_job
         print(f"  Monitoring job {job_name} in {cluster}...")
-        success = _wait_for_job_completion(job_name, cluster, region, cfg)
+        success = wait_for_job_completion(job_name, cluster, region, cfg)
         if not success:
             print(f"  Error: Job {job_name} failed or timed out. Skipping merge.")
             continue
 
         print(f"  Job {job_name} completed. Merging output chunks...")
-        _merge_output_chunks(cfg, ds)
+        merge_output_chunks(cfg, ds)
 
     print()
     print("============================================================")
     print("  Workflow Complete")
     print("============================================================")
-
-
-def _build_and_push_image(cfg: Config) -> str:
-    """Builds and pushes the Docker image, returning the new image URI."""
-    print()
-    print("Building and pushing new image...")
-    build_script = str(SCRIPT_DIR / "build_and_push.sh")
-    project_root = SCRIPT_DIR.parent
-    result = subprocess.run(
-        ["bash", build_script],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=project_root,
-    )
-    print(result.stdout)
-
-    new_image_uri = None
-    for line in result.stdout.splitlines():
-        if "Full tag:" in line:
-            new_image_uri = line.split("Full tag:")[-1].strip()
-            break
-
-    if not new_image_uri:
-        print("Error: Could not extract 'Full tag:' from build output.")
-        sys.exit(1)
-
-    return new_image_uri
-
-
-def _wait_for_job_completion(
-    job_name: str, cluster: str, region: str, cfg: Config, timeout: int = 7200
-) -> bool:
-    """Polls a GKE job until it completes or fails."""
-    if not use_cluster(cluster, region, cfg.project):
-        print(f"Error: Could not switch to cluster {cluster} to monitor job.")
-        return False
-
-    elapsed = 0
-    while elapsed < timeout:
-        output = run_output(
-            ["kubectl", "get", "job", job_name, "-o", "jsonpath='{.status.conditions[*].type}'"]
-        )
-        # output is single-quoted, e.g. 'Complete' or 'Failed'
-        status = output.strip("'")
-
-        if "Complete" in status:
-            print(f"  Job {job_name} completed successfully.")
-            return True
-        if "Failed" in status:
-            print(f"  Error: Job {job_name} has failed.")
-            return False
-
-        print(f"  [{elapsed}s] Job {job_name} still running...")
-        time.sleep(60)
-        elapsed += 60
-
-    print(f"  Error: Timeout waiting for job {job_name} to complete.")
-    return False
-
-
-def _merge_output_chunks(cfg: Config, dataset: str):
-    """Merges output chunks in GCS using gsutil compose."""
-    # This requires gsutil to be installed and authenticated.
-    # Extract GCS bucket and base path from YAML's OUTPUT_DIR
-    output_dir = cfg.output_dir
-    if not output_dir:
-        with open(cfg.job_yaml) as f:
-            yaml_content = f.read()
-        match = re.search(r'name: OUTPUT_DIR\s+value: "/gcs/([^"]+)"', yaml_content)
-        if not match:
-            print(f"Warning: Could not determine OUTPUT_DIR from {cfg.job_yaml}. Cannot merge.")
-            return
-        output_dir = "gs://" + match.group(1)
-
-    bucket_name = output_dir.replace("gs://", "").split("/")[0]
-    base_path = "/".join(output_dir.replace("gs://", "").split("/")[1:])
-
-    # The input file stem is used as the dataset name in regen_entrypoint.py
-    # We need to find what the original file was.
-    # This is a simplification; a more robust solution might need to check
-    # INPUT_FILES or PREPARE_DATA_DIR. For now, assume common names.
-    if dataset == "magpie-multilingual":
-        dataset_name_stem = "translate-bp-dataset_train"
-    else:
-        dataset_name_stem = f"{dataset}_train"
-
-    chunks_dir = f"gs://{bucket_name}/{base_path}/{dataset_name_stem}"
-    merged_file = f"gs://{bucket_name}/{base_path}/{dataset}_regen.jsonl"
-
-    print(f"  Composing chunks from {chunks_dir} into {merged_file}...")
-
-    # Get list of chunks
-    chunk_list_str = run_output(["gsutil", "ls", f"{chunks_dir}/chunk_*.jsonl"])
-    if not chunk_list_str:
-        print(f"Warning: No chunk files found at {chunks_dir}. Nothing to merge.")
-        return
-
-    chunks = chunk_list_str.splitlines()
-    if len(chunks) > 1024:
-        print(f"Warning: >1024 chunks found for {dataset}. gsutil compose has a limit of 1024.")
-        print("  Merging first 1024 chunks only.")
-        chunks = chunks[:1024]
-    
-    # Compose command
-    compose_cmd = ["gsutil", "-m", "compose"] + chunks + [merged_file]
-    
-    # Delete the merged file if it exists, as compose fails otherwise
-    run_output(["gsutil", "rm", merged_file])
-
-    result = subprocess.run(compose_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Error: gsutil compose failed for {dataset}.")
-        print(result.stderr)
-    else:
-        print(f"  Successfully merged {len(chunks)} chunks for {dataset}.")
-        # Optional: delete the source chunks
-        # run_output(["gsutil", "-m", "rm"] + chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +204,8 @@ def main():
     parser.add_argument(
         "--datasets",
         default="magpie-multilingual,perfectblend",
-        help="Comma-separated dataset names (default: magpie-multilingual,perfectblend)",
+        help="Comma-separated dataset names "
+        "(default: magpie-multilingual,perfectblend)",
     )
     parser.add_argument(
         "--output-dir",
@@ -628,7 +215,8 @@ def main():
     parser.add_argument(
         "--gpu-types",
         default="nvidia-h200-141gb,nvidia-h100-80gb",
-        help="Comma-separated GPU types to try (default: nvidia-h200-141gb,nvidia-h100-80gb)",
+        help="Comma-separated GPU types to try "
+        "(default: nvidia-h200-141gb,nvidia-h100-80gb)",
     )
     parser.add_argument(
         "--clusters",
