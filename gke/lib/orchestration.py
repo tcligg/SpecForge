@@ -249,11 +249,7 @@ def _attempt_candidate(
     )
 
     # Lazy import: keeps gke.scheduling out of the legacy import path.
-    from gke.scheduling import (
-        PendingReason,
-        diagnose_job,
-        format_summary,
-    )
+    from gke.scheduling import PendingReason, diagnose_job, format_summary
 
     elapsed = 0
     poll_interval = 30  # seconds between checks

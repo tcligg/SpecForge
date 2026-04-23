@@ -17,7 +17,6 @@ import datetime as dt
 import unittest
 from typing import Any, Dict, List
 
-from gke import scheduling
 from gke.scheduling import (
     SCALE_UP_FRESH_SECONDS,
     PendingReason,

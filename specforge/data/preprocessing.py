@@ -347,9 +347,9 @@ def build_eagle3_dataset(
     if chat_template is None:
         raise ValueError("chat_template must be provided for all dataset types")
 
-    assert chat_template in TEMPLATE_REGISTRY.get_all_template_names(), (
-        f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
-    )
+    assert (
+        chat_template in TEMPLATE_REGISTRY.get_all_template_names()
+    ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 

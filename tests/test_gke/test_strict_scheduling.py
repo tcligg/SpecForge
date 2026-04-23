@@ -25,7 +25,7 @@ Coverage targets the branches PLAN.md:330-343 specifies:
 from __future__ import annotations
 
 import unittest
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from unittest import mock
 
 from gke import orchestrator
@@ -34,10 +34,8 @@ from gke.lib.config import Config
 from gke.lib.orchestration import (
     CandidateResult,
     StrictDeployError,
-    StrictDeployResult,
     deploy_dataset_strict,
 )
-from gke.scheduling import PendingReason, PodDiagnosis
 
 
 def _make_cfg(

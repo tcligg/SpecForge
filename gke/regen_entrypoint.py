@@ -28,11 +28,10 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import List, Optional
-
-import urllib.request
-import urllib.error
 
 SPECFORGE_DIR = Path("/app/specforge")
 

@@ -4,8 +4,8 @@ import hashlib
 import math
 import os
 import time
-from datetime import datetime
 from argparse import ArgumentParser, Namespace
+from datetime import datetime
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -369,9 +369,9 @@ def sp_sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
-    assert args.batch_size == 1, (
-        f"USP only supports batch_size=1, got batch_size={args.batch_size}"
-    )
+    assert (
+        args.batch_size == 1
+    ), f"USP only supports batch_size=1, got batch_size={args.batch_size}"
 
     assert args.sp_ring_size * args.sp_ulysses_size > 1, (
         f"USP requires sp_ring_size * sp_ulysses_size > 1. "
