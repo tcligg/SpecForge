@@ -253,6 +253,17 @@ def _attempt_candidate(
 
     elapsed = 0
     poll_interval = 30  # seconds between checks
+    # Step 9: track consecutive polls where the Job has zero pods of
+    # any state. The first e2e run revealed a stall pattern where the
+    # Job's pods get purged externally (autoscaler rebalance, manual
+    # delete, etc.) and the orchestrator sat in a 30-min passive wait
+    # because ``pending_diagnoses == []`` short-circuits the
+    # CAPACITY_EXHAUSTED fall-over rule. Bailing after a few empty
+    # polls (3 × 30s = 90s) absorbs transient between-rescheduling
+    # gaps while still failing fast on a genuinely-vanished Job.
+    empty_polls = 0
+    EMPTY_POLLS_TO_BAIL = 3
+
     while elapsed < cfg.attempt_deadline:
         running, pending, other = get_pod_status(job_name)
 
@@ -283,6 +294,27 @@ def _attempt_candidate(
                     f"  {job_name}: IMAGE_PULL_ERROR on {d.pod_name} -- {d.raw_message}"
                 )
                 return CandidateResult.IMAGE_PULL_ERROR, job_name
+
+        # Empty-pods bail: Job has no pods at all for several consecutive
+        # polls. Either externally deleted, controller-stalled, or in a
+        # long between-provisioning gap that we shouldn't keep waiting
+        # for. Treat as TIMEOUT so the caller falls over to the next
+        # candidate (or sleep_retry'es if every candidate hit it).
+        if running + pending + other == 0:
+            empty_polls += 1
+            print(
+                f"    [{elapsed:>4}s] {job_name}: no pods visible "
+                f"(empty_polls={empty_polls}/{EMPTY_POLLS_TO_BAIL})"
+            )
+            if empty_polls >= EMPTY_POLLS_TO_BAIL:
+                print(
+                    f"  {job_name}: bailing — Job has been pod-empty for "
+                    f"{empty_polls * poll_interval}s. Likely externally "
+                    f"deleted or stuck."
+                )
+                return CandidateResult.TIMEOUT, job_name
+        else:
+            empty_polls = 0  # reset on any sign of life
 
         # Capacity decision: if every pending pod is CAPACITY_EXHAUSTED
         # (no recent scale-up event), there's no point waiting out the

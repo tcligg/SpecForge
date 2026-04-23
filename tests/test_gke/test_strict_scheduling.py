@@ -261,6 +261,63 @@ class StrictDeploySpotExhausted(unittest.TestCase):
         self.assertTrue(result.spot_exhausted)
 
 
+class AttemptCandidateEmptyPodsBail(unittest.TestCase):
+    """Regression for the step-9 e2e finding: orchestrator stalled for
+    the full attempt_deadline when the Job's pods got purged externally
+    and ``pending_diagnoses`` was empty."""
+
+    def test_three_consecutive_empty_polls_bails_as_timeout(self) -> None:
+        cfg = _make_cfg(attempt_deadline=600)
+
+        # Substitute the dependencies of _attempt_candidate so we
+        # exercise its real loop without hitting kubectl.
+        with (
+            mock.patch.object(orchestration, "use_cluster", return_value=True),
+            mock.patch.object(
+                orchestration, "patch_and_apply_yaml", return_value=(True, "")
+            ),
+            mock.patch.object(orchestration, "delete_job"),
+            mock.patch.object(orchestration, "get_pod_status", return_value=(0, 0, 0)),
+            mock.patch("gke.scheduling.diagnose_job", return_value=[]),
+            mock.patch("gke.scheduling.format_summary", return_value="pending=0"),
+            mock.patch.object(orchestration.time, "sleep"),  # no real sleeping
+        ):
+            outcome, job_name = orchestration._attempt_candidate(
+                cfg, "ds", "c1", "us", "nvidia-h200-141gb"
+            )
+
+        self.assertEqual(outcome, CandidateResult.TIMEOUT)
+        self.assertIsNotNone(job_name)
+
+    def test_pods_reappearing_resets_empty_counter(self) -> None:
+        """If pods come back during the empty-poll window, we stay in
+        the candidate (don't bail prematurely)."""
+        cfg = _make_cfg(attempt_deadline=600)
+
+        # Sequence: 0/0/0, 0/0/0, 8/0/0 (WIN). Without reset we'd not
+        # WIN because empty_polls would still climb; with reset, we
+        # see the WIN on the third poll.
+        status_seq = [(0, 0, 0), (0, 0, 0), (8, 0, 0)]
+
+        with (
+            mock.patch.object(orchestration, "use_cluster", return_value=True),
+            mock.patch.object(
+                orchestration, "patch_and_apply_yaml", return_value=(True, "")
+            ),
+            mock.patch.object(orchestration, "delete_job"),
+            mock.patch.object(orchestration, "get_pod_status", side_effect=status_seq),
+            mock.patch("gke.scheduling.diagnose_job", return_value=[]),
+            mock.patch("gke.scheduling.format_summary", return_value=""),
+            mock.patch.object(orchestration.time, "sleep"),
+        ):
+            outcome, job_name = orchestration._attempt_candidate(
+                cfg, "ds", "c1", "us", "nvidia-h200-141gb"
+            )
+
+        # Fewer than 3 empty polls before pods reappeared -> WIN, not bail.
+        self.assertEqual(outcome, CandidateResult.WIN)
+
+
 # ---------------------------------------------------------------------------
 # Adopt-existing-job
 # ---------------------------------------------------------------------------
