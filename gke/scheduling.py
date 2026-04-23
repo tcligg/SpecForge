@@ -37,10 +37,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 # How recent a TriggeredScaleUp event has to be for a pod to count as
-# CAPACITY_WAIT (vs. CAPACITY_EXHAUSTED). PLAN.md:309 specifies 5 min;
-# kept as a module constant so step 6 can re-tune without touching
-# decision logic.
-SCALE_UP_FRESH_SECONDS = 5 * 60
+# CAPACITY_WAIT (vs. CAPACITY_EXHAUSTED). PLAN.md:309 originally
+# specified 5 min; widened to 10 min in step 9 after the first e2e
+# run showed that pre-empted-then-rescaling pods can fall outside a
+# 5-minute window even when the autoscaler is still working on them.
+# Kept as a module constant so future tuning is one-line.
+SCALE_UP_FRESH_SECONDS = 10 * 60
 
 _CAPACITY_GPU_RE = re.compile(r"insufficient\s+nvidia\.com/gpu", re.IGNORECASE)
 _CAPACITY_NODE_RE = re.compile(

@@ -52,8 +52,14 @@ class Config:
     #
     # ``attempt_deadline``: per-(cluster, gpu) candidate budget. When
     # this expires and pods still aren't fully scheduled, fall over
-    # to the next candidate (PLAN.md:324).
-    attempt_deadline: int = 600  # 10 min
+    # to the next candidate (PLAN.md:324). Originally 10 min; widened
+    # to 30 min in step 9 because (a) image pull on a fresh node can
+    # take several minutes for the 38GB sglang image, (b) container
+    # init (sglang server warmup) eats more time, and (c) the "all
+    # pending pods CAPACITY_EXHAUSTED" rule still fires before the
+    # deadline when the autoscaler explicitly refuses, so the longer
+    # budget only matters in the slow-but-working case.
+    attempt_deadline: int = 1800  # 30 min
     # ``monitor_deadline``: how long Phase D will wait for a
     # successfully-scheduled job to finish before declaring it stuck
     # (PLAN.md:325). Used by step 7's rescue trigger.

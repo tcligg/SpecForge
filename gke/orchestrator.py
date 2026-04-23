@@ -192,8 +192,11 @@ class OrchestratorConfig:
     enable_scheduling_v2: bool = False
 
     # Step 6 — strict-scheduling tunables (forwarded to Config). See
-    # gke/lib/config.py for semantics.
-    attempt_deadline: int = 600
+    # gke/lib/config.py for semantics. Step 9 widened attempt_deadline
+    # from 600s to 1800s to better tolerate slow node provisioning +
+    # 38GB image pull on fresh spot nodes; explicit-refusal cases
+    # still fall over within seconds via the classifier rule.
+    attempt_deadline: int = 1800
     monitor_deadline: int = 14400
     spot_exhausted_strategy: str = "sleep_retry"
     spot_retry_interval: int = 900
@@ -306,7 +309,7 @@ class OrchestratorConfig:
             ignore_config_change=bool(getattr(args, "ignore_config_change", False)),
             force_rebuild=bool(getattr(args, "force_rebuild", False)),
             enable_scheduling_v2=bool(getattr(args, "enable_scheduling_v2", False)),
-            attempt_deadline=int(getattr(args, "attempt_deadline", 600) or 600),
+            attempt_deadline=int(getattr(args, "attempt_deadline", 1800) or 1800),
             monitor_deadline=int(getattr(args, "monitor_deadline", 14400) or 14400),
             spot_exhausted_strategy=str(
                 getattr(args, "spot_exhausted_strategy", "sleep_retry") or "sleep_retry"
@@ -1486,10 +1489,10 @@ def _add_common_flags(p: argparse.ArgumentParser, *, run_flags: bool) -> None:
         p.add_argument(
             "--attempt-deadline",
             type=int,
-            default=600,
+            default=1800,
             dest="attempt_deadline",
             help="Per-candidate scheduling deadline in seconds "
-            "(default: 600). When the deadline expires and pods aren't "
+            "(default: 1800). When the deadline expires and pods aren't "
             "fully scheduled, fall over to the next (cluster, gpu).",
         )
         p.add_argument(
