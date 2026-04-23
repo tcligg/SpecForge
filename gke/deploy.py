@@ -392,6 +392,15 @@ def main():
         "observer records. Step 3 of gke/PLAN.md: write-only; the "
         "orchestrator added in step 4 starts using the read path.",
     )
+    parser.add_argument(
+        "--enable-scheduling-v2",
+        action="store_true",
+        help="Step 5 of gke/PLAN.md: log gke.scheduling.diagnose_job "
+        "output every poll cycle when pods are still pending. "
+        "Observation only — does not change scheduling decisions. "
+        "Step 6 will make this the default and act on the "
+        "classifications.",
+    )
 
     # Command flags (mutually exclusive)
     cmd_group = parser.add_mutually_exclusive_group()

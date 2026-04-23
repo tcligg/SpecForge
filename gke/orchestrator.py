@@ -181,6 +181,10 @@ class OrchestratorConfig:
     from_phase: Optional[str] = None
     ignore_config_change: bool = False
     force_rebuild: bool = False
+    # Step 5: forwarded to gke.lib.config.Config so deploy_dataset's
+    # poll loop logs gke.scheduling.diagnose_job output. Step 6 makes
+    # this the default.
+    enable_scheduling_v2: bool = False
 
     # Derived from YAML (cached) ---------------------------------------
     base_name: str = ""
@@ -284,6 +288,7 @@ class OrchestratorConfig:
             from_phase=from_phase,
             ignore_config_change=bool(getattr(args, "ignore_config_change", False)),
             force_rebuild=bool(getattr(args, "force_rebuild", False)),
+            enable_scheduling_v2=bool(getattr(args, "enable_scheduling_v2", False)),
             base_name=base_name,
             yaml_output_dir=yaml_output_dir,
             yaml_prepare_dir=yaml_prepare_dir,
@@ -770,6 +775,7 @@ def _build_deploy_config(cfg: OrchestratorConfig) -> _DeployConfig:
         # min_running stays at the legacy default (ceil(N/2)) until step 6
         # flips it to total_pods. PLAN.md:317-322 owns that change.
         state_uri=cfg.state_uri,
+        enable_scheduling_v2=cfg.enable_scheduling_v2,
     )
     # total_pods / min_running are derived in Config.from_args by re-reading
     # the YAML. Reproduce that here so deploy_dataset's wait loop has the
@@ -1172,6 +1178,14 @@ def _add_common_flags(p: argparse.ArgumentParser, *, run_flags: bool) -> None:
             action="store_true",
             help="Bypass the GAR-cached image check in Phase B and always "
             "build/push a fresh tag (suffixed with a wall-clock salt).",
+        )
+        p.add_argument(
+            "--enable-scheduling-v2",
+            action="store_true",
+            help="Step 5 of gke/PLAN.md: log gke.scheduling.diagnose_job "
+            "output every poll cycle when pods are still pending. "
+            "Observation only — does not change scheduling decisions. "
+            "Step 6 will make this the default.",
         )
 
 

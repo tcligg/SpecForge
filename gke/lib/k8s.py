@@ -1,16 +1,26 @@
 """kubectl wrappers used by the deploy CLI.
 
-Extracted verbatim from gke/deploy.py in step 2. No logic changes.
+Step 2 extracted these from gke/deploy.py. Step 5 extends the module
+with JSON-returning helpers (``get_pods_json``, ``get_pod_events``)
+that the pending-reason classifier in ``gke/scheduling.py`` consumes.
 
-The single rename: _wait_for_job_completion -> wait_for_job_completion.
-gke/deploy.py re-exports the old underscore name for any external caller.
+The classifier needs structured pod state (conditions, container
+statuses, scheduling events) rather than the loose stdout that
+``get_pod_status`` returns; rather than re-parse ``kubectl get pods``
+output we shell out with ``-o json`` and let the classifier work on
+dicts. Tests can substitute captured JSON fixtures.
+
+The single legacy rename kept from step 2: ``_wait_for_job_completion``
+-> ``wait_for_job_completion``. ``gke/deploy.py`` re-exports the old
+underscore name for any external caller.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from gke.lib.clusters import use_cluster
 from gke.lib.config import Config
@@ -96,3 +106,75 @@ def wait_for_job_completion(
 
     print(f"  Error: Timeout waiting for job {job_name} to complete.")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — JSON-returning helpers for the pending-reason classifier
+# ---------------------------------------------------------------------------
+
+
+def _get_json(cmd: List[str]) -> Any:
+    """Run ``kubectl ... -o json`` and parse the result.
+
+    Returns the parsed JSON document on success or ``None`` on any
+    failure (non-zero exit, empty stdout, parse error). Callers must
+    handle the ``None`` case; the classifier degrades to ``UNKNOWN``
+    when pod or event data is unavailable, which matches the PLAN's
+    "anything else" fallback.
+    """
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def get_pods_json(job_name: str) -> List[Dict[str, Any]]:
+    """Return the full list of pods for a job as parsed JSON dicts.
+
+    Empty list on any failure. The classifier inspects
+    ``pod['status']``, ``pod['spec']``, etc. so we deliberately return
+    the raw kubectl shape rather than a narrowed view.
+    """
+    doc = _get_json(
+        [
+            "kubectl",
+            "get",
+            "pods",
+            "-l",
+            f"job-name={job_name}",
+            "-o",
+            "json",
+        ]
+    )
+    if not doc or not isinstance(doc, dict):
+        return []
+    items = doc.get("items") or []
+    return list(items) if isinstance(items, list) else []
+
+
+def get_pod_events(pod_name: str) -> List[Dict[str, Any]]:
+    """Return scheduling/lifecycle events for one pod as parsed JSON.
+
+    Filters by ``involvedObject.name`` so each call's payload stays
+    bounded to one pod's events. Empty list on any failure (and on
+    pods that have no events yet, which is normal in the first few
+    seconds after submission).
+    """
+    doc = _get_json(
+        [
+            "kubectl",
+            "get",
+            "events",
+            "--field-selector",
+            f"involvedObject.name={pod_name}",
+            "-o",
+            "json",
+        ]
+    )
+    if not doc or not isinstance(doc, dict):
+        return []
+    items = doc.get("items") or []
+    return list(items) if isinstance(items, list) else []

@@ -113,8 +113,12 @@ kubectl get job regen-gemma3-27b-perfectblend-h200-europe-west1 \
 kubectl logs <pod-name> -f
 ```
 
-After step 5 lands, the orchestrator's `status` subcommand will surface
-all of this with classified pending reasons.
+As of step 5, passing `--enable-scheduling-v2` makes both
+`gke/orchestrator.py run` and `gke/deploy.py --execute` log a
+classified per-poll digest like
+`pending=4: capacity_wait=2 capacity_exhausted=1 image_pull_error=1`
+while waiting for pods to schedule. The flag is observation-only —
+no scheduling decisions change until step 6.
 
 ## Common failures
 

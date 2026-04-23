@@ -64,6 +64,16 @@ def deploy_dataset(cfg: Config, dataset: str) -> Optional[Tuple[str, str, str]]:
     elapsed = 0
     winner: Optional[Tuple[str, str, str]] = None
 
+    # Step 5: lazy import so the classifier (and its dependency on
+    # subprocess+kubectl JSON parsing) isn't loaded unless the flag
+    # is actually set. Keeps this module's import-time footprint
+    # unchanged for callers that aren't on scheduling-v2 yet.
+    diagnose_fn = None
+    if cfg.enable_scheduling_v2:
+        from gke.scheduling import diagnose_job, format_summary
+
+        diagnose_fn = (diagnose_job, format_summary)
+
     while elapsed < cfg.schedule_timeout:
         for cluster, region, gpu in submitted:
             job_name = make_job_name(cfg.base_name, dataset, gpu, region)
@@ -76,6 +86,17 @@ def deploy_dataset(cfg: Config, dataset: str) -> Optional[Tuple[str, str, str]]:
             if running >= cfg.min_running:
                 winner = (cluster, region, gpu)
                 break
+
+            if diagnose_fn is not None and pending > 0:
+                # Observation only in step 5: we log the classifier's
+                # view of why pods are pending, but the wait loop
+                # above still uses the legacy min_running threshold.
+                # Step 6 turns these classifications into scheduling
+                # decisions.
+                diagnose_job, format_summary = diagnose_fn
+                diagnoses = diagnose_job(job_name)
+                summary = format_summary(diagnoses)
+                print(f"    [v2] {job_name}: {summary}")
 
         if winner:
             break

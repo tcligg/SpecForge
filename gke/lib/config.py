@@ -39,6 +39,12 @@ class Config:
     # writes a per-phase observer record. Step 3 only writes; step 4+
     # starts reading. None means state collection is disabled.
     state_uri: Optional[str] = None
+    # Step 5: when True, gke.lib.orchestration.deploy_dataset prints
+    # ``gke.scheduling.diagnose_job`` output every poll cycle when
+    # pods are still pending. Observation only — no scheduling
+    # decisions change. Step 6 makes this the default and acts on
+    # the classifications.
+    enable_scheduling_v2: bool = False
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
@@ -55,6 +61,7 @@ class Config:
         cfg.datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
         cfg.gpu_types = [g.strip() for g in args.gpu_types.split(",") if g.strip()]
         cfg.state_uri = getattr(args, "state_uri", None)
+        cfg.enable_scheduling_v2 = bool(getattr(args, "enable_scheduling_v2", False))
 
         # Validate JOB_YAML
         if not cfg.job_yaml:
