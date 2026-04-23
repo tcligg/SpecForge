@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from gke.lib.clusters import use_cluster
 from gke.lib.config import Config
@@ -153,6 +153,21 @@ def get_pods_json(job_name: str) -> List[Dict[str, Any]]:
         return []
     items = doc.get("items") or []
     return list(items) if isinstance(items, list) else []
+
+
+def get_job_json(job_name: str) -> Optional[Dict[str, Any]]:
+    """Return ``kubectl get job <name> -o json`` parsed; ``None`` on miss.
+
+    Used by the orchestrator's adopt-existing-job check (step 6): if
+    state recorded a Job and that Job still exists and is Active or
+    Complete, we skip the submit step. ``None`` covers both
+    "kubectl failed" and "job not found" — caller treats both as
+    "submit fresh."
+    """
+    doc = _get_json(["kubectl", "get", "job", job_name, "-o", "json"])
+    if not isinstance(doc, dict):
+        return None
+    return doc
 
 
 def get_pod_events(pod_name: str) -> List[Dict[str, Any]]:

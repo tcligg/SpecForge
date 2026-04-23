@@ -46,6 +46,26 @@ class Config:
     # the classifications.
     enable_scheduling_v2: bool = False
 
+    # Step 6 — strict-scheduling tunables. All times in seconds. The
+    # legacy ``deploy_dataset`` (race-pattern) ignores everything
+    # below; only ``deploy_dataset_strict`` reads them.
+    #
+    # ``attempt_deadline``: per-(cluster, gpu) candidate budget. When
+    # this expires and pods still aren't fully scheduled, fall over
+    # to the next candidate (PLAN.md:324).
+    attempt_deadline: int = 600  # 10 min
+    # ``monitor_deadline``: how long Phase D will wait for a
+    # successfully-scheduled job to finish before declaring it stuck
+    # (PLAN.md:325). Used by step 7's rescue trigger.
+    monitor_deadline: int = 14400  # 4 h
+    # ``spot_exhausted_strategy``: what to do when *every* candidate
+    # is CAPACITY_EXHAUSTED. ``"sleep_retry"`` waits ``spot_retry_interval``
+    # seconds and re-runs the candidate loop, capped by
+    # ``max_wait_hours``. ``"raise"`` bails immediately.
+    spot_exhausted_strategy: str = "sleep_retry"
+    spot_retry_interval: int = 900  # 15 min
+    max_wait_hours: int = 12
+
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
         # Local import to avoid a top-level dependency on the clusters

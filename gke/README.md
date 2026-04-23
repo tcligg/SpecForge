@@ -124,19 +124,32 @@ no scheduling decisions change until step 6.
 
 ### Pods stuck `Pending` indefinitely
 
-Today this happens silently — `min_running = ceil(N/2)` declares a
-winner at half-parallelism, the other pods may stay `Pending` forever
-on spot pools at capacity. Symptom: `kubectl get job` shows e.g.
-`completions: 4/8` and never advances.
+The legacy `gke/deploy.py --execute` flow declared a winner at
+`min_running = ceil(N/2)`, so half of the pods could stay `Pending`
+forever on spot pools at capacity (symptom: `kubectl get job` shows
+`completions: 4/8` and never advances). That path is deprecated.
 
-**Workaround until step 6:** check `kubectl describe pod <pending-pod>`
-for the `FailedScheduling` event. If the message is
-`Insufficient nvidia.com/gpu`, no capacity is available; either delete
-and try a different cluster, or wait for autoscaler.
+The orchestrator (step 6+) requires *full* parallelism to win a
+candidate (`min_running = total_pods`) and uses
+`gke.scheduling.diagnose_job` to decide whether to keep waiting,
+fall over to the next (cluster, gpu), or bail the dataset:
 
-**After step 6:** strict `min_running = total_pods` default; the
-orchestrator will fall over to the next candidate within
-`attempt_deadline` (10 min default).
+| Classification | Orchestrator action |
+|---|---|
+| `CAPACITY_WAIT` (recent autoscaler scale-up) | wait, up to `--attempt-deadline` (default 600s) |
+| `CAPACITY_EXHAUSTED` for **all** pending pods | delete + try next candidate |
+| `CONFIG_ERROR` (PVC, secret, affinity) | delete + abort the pipeline (operator must fix) |
+| `IMAGE_PULL_ERROR` (`ImagePullBackOff`, `ErrImagePull`) | delete + abort the pipeline |
+| `UNKNOWN` | treat as `CAPACITY_WAIT` |
+
+When *every* candidate is exhausted, the orchestrator sleeps
+`--spot-retry-interval` (default 900s) and retries until
+`--max-wait-hours` (default 12) — set `--spot-exhausted-strategy
+raise` to bail immediately instead.
+
+Resuming a run with `--run-id <id>` will adopt any Active or
+Complete Job recorded in state instead of resubmitting; pass
+`--from deploy` to force fresh submission.
 
 **After step 7:** even if shards complete partially, Phase D.5 picks
 up the missing chunks via a smaller rescue job.

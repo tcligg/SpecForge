@@ -63,7 +63,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Make sure ``gke`` is importable when this file is invoked as a script
 # from the repo root (``python3 gke/orchestrator.py ...``).
@@ -73,10 +73,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from gke import state as _state  # noqa: E402
 from gke.lib import merge as _merge  # noqa: E402
-from gke.lib.clusters import discover_clusters  # noqa: E402
+from gke.lib.clusters import discover_clusters, use_cluster  # noqa: E402
 from gke.lib.config import Config as _DeployConfig  # noqa: E402
-from gke.lib.k8s import wait_for_job_completion  # noqa: E402
-from gke.lib.orchestration import deploy_dataset  # noqa: E402
+from gke.lib.k8s import get_job_json, wait_for_job_completion  # noqa: E402
+from gke.lib.orchestration import (  # noqa: E402
+    StrictDeployError,
+    StrictDeployResult,
+    deploy_dataset_strict,
+)
 from gke.lib.yaml_patch import gpu_short_name  # noqa: E402
 
 PHASE_ORDER: Tuple[str, ...] = ("prepare", "build", "deploy", "monitor", "merge")
@@ -186,6 +190,14 @@ class OrchestratorConfig:
     # this the default.
     enable_scheduling_v2: bool = False
 
+    # Step 6 — strict-scheduling tunables (forwarded to Config). See
+    # gke/lib/config.py for semantics.
+    attempt_deadline: int = 600
+    monitor_deadline: int = 14400
+    spot_exhausted_strategy: str = "sleep_retry"
+    spot_retry_interval: int = 900
+    max_wait_hours: int = 12
+
     # Derived from YAML (cached) ---------------------------------------
     base_name: str = ""
     yaml_output_dir: Optional[str] = None  # raw OUTPUT_DIR env (for reference)
@@ -289,6 +301,13 @@ class OrchestratorConfig:
             ignore_config_change=bool(getattr(args, "ignore_config_change", False)),
             force_rebuild=bool(getattr(args, "force_rebuild", False)),
             enable_scheduling_v2=bool(getattr(args, "enable_scheduling_v2", False)),
+            attempt_deadline=int(getattr(args, "attempt_deadline", 600) or 600),
+            monitor_deadline=int(getattr(args, "monitor_deadline", 14400) or 14400),
+            spot_exhausted_strategy=str(
+                getattr(args, "spot_exhausted_strategy", "sleep_retry") or "sleep_retry"
+            ),
+            spot_retry_interval=int(getattr(args, "spot_retry_interval", 900) or 900),
+            max_wait_hours=int(getattr(args, "max_wait_hours", 12) or 12),
             base_name=base_name,
             yaml_output_dir=yaml_output_dir,
             yaml_prepare_dir=yaml_prepare_dir,
@@ -772,19 +791,24 @@ def _build_deploy_config(cfg: OrchestratorConfig) -> _DeployConfig:
         gpu_types=list(cfg.gpu_types),
         clusters=clusters,
         base_name=cfg.base_name,
-        # min_running stays at the legacy default (ceil(N/2)) until step 6
-        # flips it to total_pods. PLAN.md:317-322 owns that change.
         state_uri=cfg.state_uri,
         enable_scheduling_v2=cfg.enable_scheduling_v2,
+        attempt_deadline=cfg.attempt_deadline,
+        monitor_deadline=cfg.monitor_deadline,
+        spot_exhausted_strategy=cfg.spot_exhausted_strategy,
+        spot_retry_interval=cfg.spot_retry_interval,
+        max_wait_hours=cfg.max_wait_hours,
     )
-    # total_pods / min_running are derived in Config.from_args by re-reading
-    # the YAML. Reproduce that here so deploy_dataset's wait loop has the
-    # right targets.
+    # total_pods comes from the YAML's ``completions:``. Step 6 sets
+    # ``min_running = total_pods`` (strict default; PLAN.md:323) so
+    # deploy_dataset_strict only adopts a candidate when every shard
+    # is Running. The legacy ceil(N/2) heuristic was the source of
+    # the silent-partial-completion data loss this rebuild fixes.
     with open(cfg.config_yaml) as f:
         ymtext = f.read()
     m = re.search(r"completions:\s*(\d+)", ymtext)
     deploy_cfg.total_pods = int(m.group(1)) if m else 8
-    deploy_cfg.min_running = (deploy_cfg.total_pods + 1) // 2
+    deploy_cfg.min_running = deploy_cfg.total_pods
     return deploy_cfg
 
 
@@ -832,31 +856,125 @@ def _record_monitor(
     store.update(_mut)
 
 
+def _job_status(job_doc: Dict[str, Any]) -> str:
+    """Extract a coarse status from a kubectl Job JSON document.
+
+    Returns one of ``"Complete"``, ``"Failed"``, ``"Active"``, or
+    ``"Unknown"``. Used by the adopt-existing-job check so we can
+    decide whether to re-submit.
+    """
+    status = job_doc.get("status") or {}
+    conditions = status.get("conditions") or []
+    for cond in conditions:
+        if not isinstance(cond, dict):
+            continue
+        if cond.get("status") != "True":
+            continue
+        ctype = cond.get("type")
+        if ctype in ("Complete", "Failed"):
+            return ctype  # type: ignore[return-value]
+    if status.get("active"):
+        return "Active"
+    return "Unknown"
+
+
+def _adopt_existing_job(
+    cfg: OrchestratorConfig,
+    deploy_cfg: _DeployConfig,
+    dataset: str,
+    state: _state.RunState,
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """If state already records a Job that's still alive, adopt it.
+
+    Returns ``(job_name, cluster, region, gpu, status)`` on adopt or
+    ``None`` if the recorded job is missing/Failed (caller submits
+    fresh) or no record exists.
+
+    PLAN.md:345-347: this prevents accidentally double-submitting on
+    a resume. Status ``"Complete"`` is the cheap path — Phase D
+    immediately reports success without waiting.
+    """
+    rec = (state.phases.deploy.get(dataset) or {}).get("primary_job") or {}
+    job_name = rec.get("job_name")
+    cluster = rec.get("cluster")
+    region = rec.get("region")
+    gpu = rec.get("gpu") or ""
+    if not (job_name and cluster and region):
+        return None
+
+    if not use_cluster(cluster, region, cfg.project):
+        print(
+            f"  [adopt] {dataset}: recorded job {job_name} on {cluster} but "
+            f"kubectl context switch failed; submitting fresh."
+        )
+        return None
+
+    job_doc = get_job_json(job_name)
+    if job_doc is None:
+        print(
+            f"  [adopt] {dataset}: recorded job {job_name} no longer exists "
+            f"on {cluster}; submitting fresh."
+        )
+        return None
+
+    status = _job_status(job_doc)
+    if status == "Failed":
+        print(
+            f"  [adopt] {dataset}: recorded job {job_name} is Failed; submitting fresh."
+        )
+        return None
+    if status not in ("Active", "Complete"):
+        print(
+            f"  [adopt] {dataset}: recorded job {job_name} has unknown status; "
+            f"submitting fresh."
+        )
+        return None
+
+    print(f"  [adopt] {dataset}: reusing existing job {job_name} (status={status}).")
+    return job_name, cluster, region, gpu, status
+
+
 def phase_c_deploy_dataset(
     cfg: OrchestratorConfig,
     deploy_cfg: _DeployConfig,
     store: _state.StateStore,
+    state: _state.RunState,
     dataset: str,
 ) -> Optional[Tuple[str, str, str, str]]:
-    """Submit and race for one dataset; returns (job_name, cluster, region, gpu).
+    """Strict-scheduling Phase C: returns (job_name, cluster, region, gpu).
 
-    Wraps ``gke.lib.orchestration.deploy_dataset`` and writes a deploy
-    record to state. This is Phase C in the PLAN sense; step 6 will
-    replace the underlying helper with strict scheduling. Returning the
-    GPU type lets Phase D record it (the legacy helper drops it).
+    1. Adopt-existing-job: if state already points at an Active or
+       Complete Job, reuse it without resubmitting.
+    2. Otherwise, drive ``deploy_dataset_strict`` and record the
+       outcome. Operator-fixable failures (CONFIG_ERROR, IMAGE_PULL_ERROR)
+       propagate as ``StrictDeployError`` so the caller can stop the
+       whole pipeline rather than silently move to the next dataset.
     """
-    result = deploy_dataset(deploy_cfg, dataset)
-    if result is None:
-        return None
-    job_name, cluster, region = result
+    adopted = _adopt_existing_job(cfg, deploy_cfg, dataset, state)
+    if adopted is not None:
+        job_name, cluster, region, gpu, _status = adopted
+        return job_name, cluster, region, gpu
 
-    # Recover the GPU type from the job_name suffix; ``make_job_name``
-    # appends ``gpu_short_name(gpu)``. We brute-force over candidates.
-    gpu = ""
-    for candidate in cfg.gpu_types:
-        if gpu_short_name(candidate) in job_name:
-            gpu = candidate
-            break
+    try:
+        result: StrictDeployResult = deploy_dataset_strict(deploy_cfg, dataset)
+    except StrictDeployError as exc:
+        print(f"  Error: {exc}")
+        # Re-raise so ``cmd_run`` can decide whether to abort the
+        # whole run; the existing per-dataset try/except in the
+        # orchestrator catches this in step 6's wiring.
+        raise
+
+    if not result.succeeded:
+        if result.spot_exhausted:
+            print(
+                f"  Warning: {dataset} spot-exhausted across all candidates "
+                f"and --max-wait-hours hit; deferring."
+            )
+        return None
+
+    assert result.winner is not None
+    job_name, cluster, region = result.winner
+    gpu = result.winner_gpu
 
     _record_deploy(
         store,
@@ -997,7 +1115,16 @@ def cmd_run(cfg: OrchestratorConfig) -> None:
                 # Nothing to redo on C/D; fall through to Phase E.
                 print(f"  [skip] {ds}: monitor record already says Complete.")
             else:
-                deploy_result = phase_c_deploy_dataset(cfg, deploy_cfg, store, ds)
+                try:
+                    deploy_result = phase_c_deploy_dataset(
+                        cfg, deploy_cfg, store, latest, ds
+                    )
+                except StrictDeployError as exc:
+                    # Operator-fixable failure: fail the pipeline rather
+                    # than silently skip and lose the dataset. The
+                    # remaining datasets are likely to hit the same
+                    # error (image is global, YAML configs are shared).
+                    sys.exit(f"Error: pipeline aborted: {exc}")
                 if deploy_result is None:
                     print(
                         f"  Warning: failed to deploy {ds}; skipping monitor + merge."
@@ -1182,10 +1309,51 @@ def _add_common_flags(p: argparse.ArgumentParser, *, run_flags: bool) -> None:
         p.add_argument(
             "--enable-scheduling-v2",
             action="store_true",
-            help="Step 5 of gke/PLAN.md: log gke.scheduling.diagnose_job "
-            "output every poll cycle when pods are still pending. "
-            "Observation only — does not change scheduling decisions. "
-            "Step 6 will make this the default.",
+            help="No-op as of step 6 (the orchestrator always uses strict "
+            "scheduling). Kept for back-compat; only `gke/deploy.py "
+            "--execute` (legacy racing pattern) still consults the flag.",
+        )
+        # Step 6: per-(cluster, gpu) candidate budget.
+        p.add_argument(
+            "--attempt-deadline",
+            type=int,
+            default=600,
+            dest="attempt_deadline",
+            help="Per-candidate scheduling deadline in seconds "
+            "(default: 600). When the deadline expires and pods aren't "
+            "fully scheduled, fall over to the next (cluster, gpu).",
+        )
+        p.add_argument(
+            "--monitor-deadline",
+            type=int,
+            default=14400,
+            dest="monitor_deadline",
+            help="How long Phase D will wait for a successfully scheduled "
+            "job to finish before declaring it stuck (default: 14400 = 4h). "
+            "Used by step 7's rescue trigger.",
+        )
+        p.add_argument(
+            "--spot-exhausted-strategy",
+            choices=("sleep_retry", "raise"),
+            default="sleep_retry",
+            dest="spot_exhausted_strategy",
+            help="When every candidate is CAPACITY_EXHAUSTED: 'sleep_retry' "
+            "waits --spot-retry-interval and re-runs the candidate loop "
+            "until --max-wait-hours; 'raise' bails immediately.",
+        )
+        p.add_argument(
+            "--spot-retry-interval",
+            type=int,
+            default=900,
+            dest="spot_retry_interval",
+            help="Seconds to sleep between spot-retry rounds (default: 900).",
+        )
+        p.add_argument(
+            "--max-wait-hours",
+            type=int,
+            default=12,
+            dest="max_wait_hours",
+            help="Cap on total spot-retry wait before giving up (default: 12).",
         )
 
 

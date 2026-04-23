@@ -196,14 +196,29 @@ def _observe(
 def cmd_execute(cfg: Config):
     """End-to-end workflow: build, push, deploy, wait, merge.
 
+    DEPRECATED. Step 6 of gke/PLAN.md replaced this with
+    ``python3 gke/orchestrator.py run``. The ``--execute`` mode here
+    still uses the legacy candidate-racing pattern (``deploy_dataset``)
+    with ``min_running = ceil(N/2)``, which is subject to the silent
+    partial-completion data-loss problem the rebuild fixes. Step 8
+    will reduce this CLI to a deprecation shim with no ``--execute``.
+
     When --state-uri is set, writes an observer record to the configured
-    GCS path at each phase boundary (build/deploy/monitor/merge). State
-    is write-only in step 3; the orchestrator added in step 4 is the
-    first reader.
+    GCS path at each phase boundary (build/deploy/monitor/merge).
     """
+    import warnings
+
+    warnings.warn(
+        "gke/deploy.py --execute is deprecated. Use "
+        "`python3 gke/orchestrator.py run --config <yaml>` instead. "
+        "Step 8 of gke/PLAN.md will remove --execute entirely.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     print()
     print("============================================================")
     print("  Executing End-to-End Regeneration Workflow")
+    print("  (DEPRECATED — see gke/orchestrator.py)")
     print("============================================================")
 
     # 0. Initialize state observer (optional, gated on --state-uri).
