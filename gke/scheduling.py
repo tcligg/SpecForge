@@ -50,9 +50,17 @@ _CAPACITY_NODE_RE = re.compile(
 _CONFIG_ERROR_PATTERNS: Sequence[re.Pattern[str]] = (
     re.compile(r"\b(?:volume|persistentvolumeclaim|pvc)\b", re.IGNORECASE),
     re.compile(r"\bsecret\s+\".*?\"\s+not\s+found", re.IGNORECASE),
-    re.compile(r"\b(?:nodeaffinity|nodeselector|node\s+affinity)\b", re.IGNORECASE),
-    re.compile(r"\btoleration\b", re.IGNORECASE),
     re.compile(r"\bconfigmap\b", re.IGNORECASE),
+    # NOTE: deliberately NOT matching ``node affinity/selector`` here.
+    # GKE emits ``0/N nodes are available: M node(s) didn't match Pod's
+    # node affinity/selector`` when a cluster has zero nodes of the
+    # requested GPU/spot shape — operationally a capacity issue (try a
+    # different cluster) rather than a config error (operator must fix).
+    # The few cases where it *is* a config error (operator added a
+    # custom affinity that no node matches) are rare enough that
+    # treating them as CAPACITY_EXHAUSTED + falling over to the next
+    # candidate is the right default.
+    # Toleration mismatches are similarly ambiguous and excluded.
 )
 _IMAGE_PULL_REASONS = frozenset(
     {"ImagePullBackOff", "ErrImagePull", "InvalidImageName"}

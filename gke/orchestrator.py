@@ -469,6 +469,29 @@ def _record_prepare(
     store.update(_mut)
 
 
+def _gsutil_count_lines(uri: str) -> Optional[int]:
+    """Count newlines in a GCS object via ``gsutil cat | wc -l``.
+
+    Returns None on subprocess failure. Used by Phase A's adopt-existing
+    branch when state has no record but the destination already has a
+    prepared file (common after a manual seeding or a prior orchestrator
+    run that didn't write state). The line count is required by Phase
+    D.5 rescue's ``compute_missing_chunks``.
+    """
+    proc = subprocess.run(
+        f"gsutil cat {uri} | wc -l",
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip().split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
 def phase_a_prepare(
     cfg: OrchestratorConfig,
     store: _state.StateStore,
@@ -479,13 +502,20 @@ def phase_a_prepare(
     """Prepare each dataset locally and publish to GCS.
 
     Skip rules:
-      * ``state.phases.prepare[ds].status == "ok"`` AND
-      * the recorded ``uri`` exists in GCS with size >= recorded size.
+      1. ``state.phases.prepare[ds].status == "ok"`` AND the recorded
+         ``uri`` exists in GCS with size >= recorded size.
+      2. (Adopt-existing) State has no record, but the destination
+         GCS file already exists with size > 0. We adopt it, count
+         its lines (needed by Phase D.5 rescue), and write a state
+         record. Common after a manual seeding or a prior orchestrator
+         run that didn't write state — the right thing to do per
+         Phase A's actual purpose ("make sure prepared data is in
+         GCS"). Pass ``force=True`` to bypass adopt-existing.
 
-    On skip, we still re-stat to confirm the object hasn't been deleted.
-    On miss, run ``scripts/prepare_data.py`` into a tempdir and ``gsutil
-    cp`` the result into place. Line count is recorded for Phase D.5
-    (rescue) and for sanity-checking the merged output in Phase E.
+    On miss, run ``scripts/prepare_data.py`` into a tempdir and
+    ``gsutil cp`` the result into place. Line count is recorded for
+    Phase D.5 (rescue) and for sanity-checking the merged output in
+    Phase E.
     """
     print()
     print("[Phase A] Prepare datasets")
@@ -514,6 +544,38 @@ def phase_a_prepare(
                 f"or smaller than recorded (recorded={recorded_size}, "
                 f"actual={actual})"
             )
+
+        # Adopt-existing branch: state has no record (or it points
+        # elsewhere), but the destination already has a non-empty
+        # file. Reuse it and write a fresh state record so Phase D.5
+        # rescue has the n_lines it needs.
+        if not force and rec.get("status") != "ok":
+            existing_size = _gsutil_stat_size(dest_uri)
+            if existing_size is not None and existing_size > 0:
+                print(
+                    f"  [adopt] {dataset}: {dest_uri} already exists "
+                    f"({existing_size} bytes); counting lines to record state."
+                )
+                n_lines = _gsutil_count_lines(dest_uri)
+                if n_lines is None or n_lines == 0:
+                    print(
+                        f"  [redo]  {dataset}: line count failed or zero; "
+                        "falling back to full preparation."
+                    )
+                else:
+                    _record_prepare(
+                        store,
+                        dataset,
+                        status="ok",
+                        uri=dest_uri,
+                        size=existing_size,
+                        n_lines=n_lines,
+                    )
+                    print(
+                        f"  [done]  {dataset}: adopted "
+                        f"({existing_size} bytes, {n_lines} lines)."
+                    )
+                    continue
 
         print(f"  [run]  {dataset}: preparing -> {dest_uri}")
         with tempfile.TemporaryDirectory(prefix=f"prepare-{dataset}-") as tmp:

@@ -57,7 +57,7 @@ spec:
         # image: rewritten by gke/orchestrator.py Phase B at run time.
         # The placeholder below keeps the file kubectl-applyable when
         # debugging by hand; do not rely on this tag in production.
-        image: us-central1-docker.pkg.dev/pyc-vtx-dev/pyc-vtx-us-central1/specforge-regen:UNPINNED
+        image: us-central1-docker.pkg.dev/cloud-llm-test/tcli-test/specforge-regen:93faec22c91e-dirtyc0dc5065
         resources:
           limits:
             nvidia.com/gpu: 8
@@ -102,6 +102,8 @@ spec:
         volumeMounts:
         - name: gcsfuse
           mountPath: /gcs/pyc-eagle-data
+        - name: gcsfuse-test
+          mountPath: /gcs/tcli-llm-test
         - name: dshm
           mountPath: /dev/shm
       restartPolicy: OnFailure
@@ -113,6 +115,11 @@ spec:
           driver: gcsfuse.csi.storage.gke.io
           volumeAttributes:
             bucketName: pyc-eagle-data
+      - name: gcsfuse-test
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: tcli-llm-test
       - name: dshm
         emptyDir:
           medium: Memory

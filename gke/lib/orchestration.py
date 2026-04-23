@@ -227,6 +227,15 @@ def _attempt_candidate(
         print(f"  {cluster}: failed to connect kubectl, skipping.")
         return CandidateResult.SUBMIT_FAILED, None
 
+    # Best-effort delete of any stale Job by the same name. Kubernetes
+    # Jobs have an immutable spec.template, so re-applying with even
+    # one env-value or completion-count change fails. The orchestrator
+    # routinely revisits the same (dataset, gpu, cluster) tuple
+    # (resume, retries, rescue) so this is a normal case, not a
+    # surprise. delete_job uses --ignore-not-found so a missing Job
+    # is a no-op.
+    delete_job(job_name)
+
     success, err = patch_and_apply_yaml(cfg, dataset, gpu, region)
     if not success:
         print(f"  {job_name}: kubectl apply failed.")

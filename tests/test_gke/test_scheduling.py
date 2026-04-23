@@ -154,13 +154,21 @@ class ClassifyPodTests(unittest.TestCase):
         diag = classify_pod(pod, [], now=self.now)
         self.assertEqual(diag.reason, PendingReason.CONFIG_ERROR)
 
-    def test_config_error_node_affinity(self) -> None:
+    def test_node_affinity_classified_as_capacity_not_config(self) -> None:
+        # GKE emits this when the cluster has zero nodes of the requested
+        # GPU/spot shape. Operationally a capacity issue (try the next
+        # cluster), not a config error (operator must fix). See the
+        # comment on _CONFIG_ERROR_PATTERNS in gke/scheduling.py.
         pod = _pending_pod(
             "p",
-            sched_message="0/3 nodes are available: 3 node(s) didn't match Pod's node affinity.",
+            sched_message=(
+                "0/1 nodes are available: 1 node(s) didn't match Pod's "
+                "node affinity/selector. preemption: 0/1 nodes are "
+                "available: 1 Preemption is not helpful for scheduling."
+            ),
         )
         diag = classify_pod(pod, [], now=self.now)
-        self.assertEqual(diag.reason, PendingReason.CONFIG_ERROR)
+        self.assertEqual(diag.reason, PendingReason.CAPACITY_EXHAUSTED)
 
     def test_unknown_when_no_signal_matches(self) -> None:
         pod = _pending_pod("p", sched_message="something completely new")
