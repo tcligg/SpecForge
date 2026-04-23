@@ -4,18 +4,22 @@ This directory contains the SpecForge data-regeneration pipeline that
 runs on GKE. Use this README when you are operating the system. For
 design rationale and the rebuild plan, see `gke/PLAN.md`.
 
-> **Status:** mid-rebuild. As of step 4b the entrypoint is
-> `python3 gke/orchestrator.py run` (with `run_gke_regen.sh` reduced
-> to a thin wrapper). Phases A/B/E run natively; C/D use the helpers
-> in `gke.lib.{orchestration,k8s}` directly (legacy candidate-racing,
-> until step 6 swaps in strict scheduling). The deploy CLI is now
-> only used for `--status` / `--delete` ops shortcuts.
+> **Status:** rebuild complete (PLAN.md steps 0-8). The entrypoint
+> is `python3 gke/orchestrator.py run`; `run_gke_regen.sh` is a thin
+> wrapper. All six phases (Prepare → Build → Deploy → Monitor →
+> Rescue → Merge) run natively from the orchestrator. The deploy
+> CLI is now an ops-shortcut shim with `--status`, `--delete`, and a
+> deprecated `--execute` that re-execs the orchestrator.
 >
 > Phase B skips the docker build when the computed `<git-sha>` (or
 > `<sha>-dirty<hash>`) tag is already present in Artifact Registry;
 > pass `--force-rebuild` to override. The regen YAMLs no longer pin
 > a real `image:` tag — the orchestrator writes the resolved tag at
 > run time.
+>
+> Phase D.5 rescue automatically picks up missing chunks after the
+> primary job; trigger it manually with
+> `python3 gke/orchestrator.py rescue --config <yaml> --run-id <id>`.
 
 ## Quick start (current state)
 
@@ -113,12 +117,11 @@ kubectl get job regen-gemma3-27b-perfectblend-h200-europe-west1 \
 kubectl logs <pod-name> -f
 ```
 
-As of step 5, passing `--enable-scheduling-v2` makes both
-`gke/orchestrator.py run` and `gke/deploy.py --execute` log a
-classified per-poll digest like
+As of step 6, the orchestrator's strict-scheduling path always logs
+a classified per-poll digest like
 `pending=4: capacity_wait=2 capacity_exhausted=1 image_pull_error=1`
-while waiting for pods to schedule. The flag is observation-only —
-no scheduling decisions change until step 6.
+while waiting for pods to schedule, and uses those classifications
+to decide whether to wait, fall over, or bail.
 
 ## Common failures
 
@@ -127,7 +130,8 @@ no scheduling decisions change until step 6.
 The legacy `gke/deploy.py --execute` flow declared a winner at
 `min_running = ceil(N/2)`, so half of the pods could stay `Pending`
 forever on spot pools at capacity (symptom: `kubectl get job` shows
-`completions: 4/8` and never advances). That path is deprecated.
+`completions: 4/8` and never advances). After step 8, `--execute`
+re-execs the orchestrator instead.
 
 The orchestrator (step 6+) requires *full* parallelism to win a
 candidate (`min_running = total_pods`) and uses
