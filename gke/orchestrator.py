@@ -71,6 +71,7 @@ _PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from gke import rescue as _rescue  # noqa: E402
 from gke import state as _state  # noqa: E402
 from gke.lib import merge as _merge  # noqa: E402
 from gke.lib.clusters import discover_clusters, use_cluster  # noqa: E402
@@ -198,6 +199,10 @@ class OrchestratorConfig:
     spot_retry_interval: int = 900
     max_wait_hours: int = 12
 
+    # Step 7 — rescue (Phase D.5) tunables. PLAN.md:377.
+    max_rescue_attempts: int = 3
+    max_rescue_shards: int = 4
+
     # Derived from YAML (cached) ---------------------------------------
     base_name: str = ""
     yaml_output_dir: Optional[str] = None  # raw OUTPUT_DIR env (for reference)
@@ -308,6 +313,8 @@ class OrchestratorConfig:
             ),
             spot_retry_interval=int(getattr(args, "spot_retry_interval", 900) or 900),
             max_wait_hours=int(getattr(args, "max_wait_hours", 12) or 12),
+            max_rescue_attempts=int(getattr(args, "max_rescue_attempts", 3) or 3),
+            max_rescue_shards=int(getattr(args, "max_rescue_shards", 4) or 4),
             base_name=base_name,
             yaml_output_dir=yaml_output_dir,
             yaml_prepare_dir=yaml_prepare_dir,
@@ -798,17 +805,28 @@ def _build_deploy_config(cfg: OrchestratorConfig) -> _DeployConfig:
         spot_exhausted_strategy=cfg.spot_exhausted_strategy,
         spot_retry_interval=cfg.spot_retry_interval,
         max_wait_hours=cfg.max_wait_hours,
+        max_rescue_attempts=cfg.max_rescue_attempts,
+        max_rescue_shards=cfg.max_rescue_shards,
     )
     # total_pods comes from the YAML's ``completions:``. Step 6 sets
     # ``min_running = total_pods`` (strict default; PLAN.md:323) so
     # deploy_dataset_strict only adopts a candidate when every shard
     # is Running. The legacy ceil(N/2) heuristic was the source of
     # the silent-partial-completion data loss this rebuild fixes.
+    #
+    # CHUNK_SIZE comes from the YAML's env (default 500) so the rescue
+    # path knows the chunk-id space without re-reading the YAML.
     with open(cfg.config_yaml) as f:
         ymtext = f.read()
     m = re.search(r"completions:\s*(\d+)", ymtext)
     deploy_cfg.total_pods = int(m.group(1)) if m else 8
     deploy_cfg.min_running = deploy_cfg.total_pods
+    chunk_size_str = _read_env_value(ymtext, "CHUNK_SIZE")
+    if chunk_size_str:
+        try:
+            deploy_cfg.chunk_size = int(chunk_size_str)
+        except ValueError:
+            pass  # fall back to the dataclass default (500)
     return deploy_cfg
 
 
@@ -1139,9 +1157,47 @@ def cmd_run(cfg: OrchestratorConfig) -> None:
                     cluster=cluster,
                     region=region,
                 )
-                if not ok:
-                    print(f"  Error: {ds} job failed/timed out; skipping merge.")
-                    continue
+                # Phase D.5 (rescue): triggered when the primary job
+                # didn't terminate cleanly *or* when chunks are still
+                # missing despite a Complete status (defensive — the
+                # scheduler has been observed to mark Jobs Complete
+                # while a few shards quietly never produced output).
+                latest = store.read() or state
+                try:
+                    missing = _rescue.compute_missing_chunks(latest, deploy_cfg, ds)
+                except ValueError as exc:
+                    print(f"  Warning: rescue analysis skipped for {ds}: {exc}")
+                    missing = []
+                if missing or not ok:
+                    if not missing and not ok:
+                        # Nothing to rescue but D failed — likely a
+                        # whole-job failure with no chunks done yet.
+                        # Skip rescue attempt for this dataset (it
+                        # would just hit the same failure mode) and
+                        # let the operator decide.
+                        print(
+                            f"  Error: {ds} job failed and no chunks done; "
+                            f"skipping merge."
+                        )
+                        continue
+                    if missing:
+                        print(
+                            f"  {ds}: {len(missing)} chunks missing; "
+                            f"invoking Phase D.5 rescue."
+                        )
+                        try:
+                            _rescue.phase_d5_rescue_dataset(
+                                deploy_cfg,
+                                latest,
+                                store,
+                                ds,
+                                src_yaml=cfg.config_yaml,
+                                base_name=cfg.base_name,
+                            )
+                        except _rescue.RescueError as exc:
+                            print(f"  Error: rescue failed for {ds}: {exc}")
+                            print(f"  Skipping merge for {ds}.")
+                            continue
 
         if needs_e:
             phase_e_merge_dataset(deploy_cfg, store, ds)
@@ -1222,7 +1278,58 @@ def _stub(name: str):
 cmd_logs = _stub("logs")
 cmd_cancel = _stub("cancel")
 cmd_cleanup = _stub("cleanup")
-cmd_rescue = _stub("rescue")
+
+
+def cmd_rescue(cfg: OrchestratorConfig) -> None:
+    """Manually trigger Phase D.5 rescue for one or more datasets.
+
+    Useful when the orchestrator's automatic D->D.5 hand-off was
+    skipped (e.g. the orchestrator died between Phase D and the
+    rescue check, or the operator wants to re-attempt rescue with
+    different `--max-rescue-*` settings).
+
+    PLAN.md:374: ``gke/orchestrator.py rescue --run-id ID --dataset NAME``.
+    Without ``--dataset``, runs rescue for every dataset in the run.
+    """
+    if not cfg.explicit_run_id:
+        sys.exit(
+            "Error: rescue requires --run-id <id> to identify the run "
+            "whose state we should consult."
+        )
+
+    store = _state.StateStore(cfg.state_uri)
+    state = store.read()
+    if state is None:
+        sys.exit(f"Error: no state at {cfg.state_uri}; cannot rescue.")
+
+    deploy_cfg = _build_deploy_config(cfg)
+
+    failures = []
+    for ds in cfg.datasets:
+        print()
+        print(f"== Rescue {ds} ==")
+        try:
+            _rescue.phase_d5_rescue_dataset(
+                deploy_cfg,
+                state,
+                store,
+                ds,
+                src_yaml=cfg.config_yaml,
+                base_name=cfg.base_name,
+            )
+        except _rescue.RescueError as exc:
+            failures.append((ds, str(exc)))
+            print(f"  Error: {exc}")
+        except ValueError as exc:
+            failures.append((ds, str(exc)))
+            print(f"  Skipped: {exc}")
+
+    if failures:
+        print()
+        print("Rescue summary — failures:")
+        for ds, msg in failures:
+            print(f"  {ds}: {msg}")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,6 +1462,24 @@ def _add_common_flags(p: argparse.ArgumentParser, *, run_flags: bool) -> None:
             dest="max_wait_hours",
             help="Cap on total spot-retry wait before giving up (default: 12).",
         )
+        # Step 7 — rescue (Phase D.5).
+        p.add_argument(
+            "--max-rescue-attempts",
+            type=int,
+            default=3,
+            dest="max_rescue_attempts",
+            help="How many rescue rounds to run before giving up on a "
+            "dataset (default: 3).",
+        )
+        p.add_argument(
+            "--max-rescue-shards",
+            type=int,
+            default=4,
+            dest="max_rescue_shards",
+            help="Cap on the rescue job's pod count (default: 4). Rescue "
+            "jobs only process the missing chunks; this prevents "
+            "accidentally launching N=64 pods to process 4 missing chunks.",
+        )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -1373,7 +1498,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p_status = sub.add_parser("status", help="Print state summary for a run.")
     _add_common_flags(p_status, run_flags=False)
 
-    for name in ("logs", "cancel", "cleanup", "rescue"):
+    p_rescue = sub.add_parser(
+        "rescue",
+        help="Manually trigger Phase D.5 rescue for an existing run.",
+    )
+    _add_common_flags(p_rescue, run_flags=True)
+
+    for name in ("logs", "cancel", "cleanup"):
         p_stub = sub.add_parser(
             name, help=f"(stub) lands in a later step of gke/PLAN.md"
         )

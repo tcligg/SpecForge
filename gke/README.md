@@ -151,8 +151,27 @@ Resuming a run with `--run-id <id>` will adopt any Active or
 Complete Job recorded in state instead of resubmitting; pass
 `--from deploy` to force fresh submission.
 
-**After step 7:** even if shards complete partially, Phase D.5 picks
-up the missing chunks via a smaller rescue job.
+**Phase D.5 rescue (step 7):** after Phase D, the orchestrator
+inspects which `chunk_*.done` markers exist in GCS. If any chunks
+are missing — including the case where the Job reports Complete
+but a few shards quietly never produced output — it patches the
+YAML with `completions=min(missing, --max-rescue-shards)` and
+`EXTRA_REGEN_ARGS=--chunk-ids ...`, then submits the rescue job
+through the same strict-scheduling path. Up to
+`--max-rescue-attempts` rounds (default 3); each round re-checks
+which chunks are still missing.
+
+Manual rescue trigger:
+
+```bash
+python3 gke/orchestrator.py rescue \
+    --config gke/regen-gemma3-27b.yaml \
+    --run-id <id> \
+    --datasets ds1[,ds2,...]
+```
+
+State records each attempt under `rescue[ds].attempts[]` so the
+operator can see exactly which chunks each round covered.
 
 ### `permission denied while trying to connect to the Docker daemon`
 

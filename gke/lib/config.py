@@ -66,6 +66,21 @@ class Config:
     spot_retry_interval: int = 900  # 15 min
     max_wait_hours: int = 12
 
+    # Step 7 — rescue (Phase D.5) tunables. PLAN.md:377.
+    #
+    # ``max_rescue_attempts``: how many rescue rounds to run before
+    # giving up on a dataset.
+    # ``max_rescue_shards``: cap on the rescue job's pod count.
+    # Rescue jobs typically need fewer shards than the primary because
+    # they only process the missing chunks; capping this prevents
+    # accidentally launching N=64 pods to process 4 missing chunks.
+    max_rescue_attempts: int = 3
+    max_rescue_shards: int = 4
+    # ``chunk_size`` is read from the YAML's CHUNK_SIZE env at
+    # _build_deploy_config time so compute_missing_chunks knows the
+    # chunk-id space without re-parsing the YAML.
+    chunk_size: int = 500
+
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
         # Local import to avoid a top-level dependency on the clusters
