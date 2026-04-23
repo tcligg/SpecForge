@@ -43,9 +43,21 @@ echo "Configuring Docker auth for ${REGISTRY}..."
 gcloud auth configure-docker "${REGISTRY}" --quiet
 
 # Build
+#
+# --pull forces docker to re-fetch the FROM image (lmsysorg/sglang:dev)
+# from the registry on every build, ignoring the local layer cache for
+# the base. We need this because :dev is a moving tag — a stale local
+# copy means we ship an outdated sglang against the latest transformers,
+# which surfaces as runtime errors like the 2026-04-23 Gemma3
+# `KeyError: None` in `ROPE_INIT_FUNCTIONS[self.rope_type]`.
+#
+# Phase B in the orchestrator skips the build entirely when the image
+# tag is already in GAR, so the pull cost only hits when we actually
+# rebuild — which is exactly when we want a fresh base.
 echo ""
 echo "Building image..."
 docker build \
+    --pull \
     -t "${FULL_IMAGE}" \
     -f "${REPO_ROOT}/gke/Dockerfile" \
     "${REPO_ROOT}"
